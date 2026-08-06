@@ -84,7 +84,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | `mode` | string | 否 | `instant` | 模式（别名：`model`） |
 | `deep_thinking` | bool | 否 | `false` | 深度思考（别名：`think` / `deep_think`） |
 | `search` | bool | 否 | `false` | 智能搜索（别名：`web_search` / `smart_search`） |
-| `timeout` | int | 否 | 环境变量 | 等待回复秒数 |
+| `timeout` | int | 否 | 见下 | 等待回复秒数；不传时：普通 `DEEPSEEK_CHAT_TIMEOUT_S`(默认 300)，专家/深度思考用 `DEEPSEEK_THINK_TIMEOUT_S`(默认 600) |
 
 ### `mode` 取值
 
@@ -259,5 +259,7 @@ print(r2["answer"])
 | `SQLITE_PATH` | 默认 `data/data.db` |
 | `DEEPSEEK_USERNAME` / `DEEPSEEK_PASSWORD` | 网页登录账号 |
 | `DEEPSEEK_AUTO_LOGIN` | 是否自动填表登录 |
-| `DEEPSEEK_TIMEOUT_MS` | 单次操作默认超时（毫秒） |
+| `DEEPSEEK_TIMEOUT_MS` | Playwright 页面操作超时（登录/点击等），默认 120000 |
+| `DEEPSEEK_CHAT_TIMEOUT_S` | 普通聊天等待回复秒数，默认 300 |
+| `DEEPSEEK_THINK_TIMEOUT_S` | 专家模式或深度思考等待回复秒数，默认 600 |
 | `LOG_DIR` | 日志目录，默认 `logs` |

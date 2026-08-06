@@ -236,7 +236,11 @@ class DeepSeekClient:
         if resolved_mode == "expert" and search:
             raise ValueError("expert mode does not support search; use mode=instant")
 
-        timeout_s = timeout_s or max(30, self.timeout_ms // 1000)
+        timeout_s = self._resolve_chat_timeout_s(
+            timeout_s,
+            mode=resolved_mode,
+            deep_thinking=deep_thinking,
+        )
         # Validate/normalize on the caller thread, then run all browser work on
         # the single Playwright worker thread (sync API is thread-bound).
         return self._submit(
@@ -249,6 +253,19 @@ class DeepSeekClient:
                 timeout_s=timeout_s,
             )
         )
+
+    def _resolve_chat_timeout_s(
+        self,
+        timeout_s: int | None,
+        *,
+        mode: str,
+        deep_thinking: bool,
+    ) -> int:
+        if timeout_s is not None:
+            return max(30, int(timeout_s))
+        if mode == "expert" or deep_thinking:
+            return max(30, config.deepseek_think_timeout_s)
+        return max(30, config.deepseek_chat_timeout_s)
 
     def _ask_impl(
         self,
@@ -264,13 +281,14 @@ class DeepSeekClient:
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
         logger.info(
-            "ask start state=%s conv=%s mode=%s think=%s search=%s chars=%s",
+            "ask start state=%s conv=%s mode=%s think=%s search=%s chars=%s timeout_s=%s",
             state,
             conversation_id,
             mode,
             deep_thinking,
             search,
             len(question),
+            timeout_s,
         )
         if state == "auth":
             if not self._ensure_logged_in(page):
@@ -776,32 +794,58 @@ class DeepSeekClient:
         except Exception:
             return ""
 
+    def _is_generating(self, page: Page) -> bool:
+        """True while DeepSeek is still producing a reply (stop control visible)."""
+        selectors = [
+            "button:has-text('停止')",
+            "div[role='button']:has-text('停止')",
+            "button:has-text('Stop')",
+            "div[role='button']:has-text('Stop')",
+            "[aria-label*='Stop']",
+            "[aria-label*='停止']",
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 4)
+                for i in range(count):
+                    if loc.nth(i).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
+
     def _wait_answer(self, page: Page, *, before_count: int, timeout_s: int) -> str:
         deadline = time.time() + timeout_s
         previous = ""
         stable = 0
         saw_new = False
+        # Longer quiet period for long replies / deep thinking streams.
+        need_stable = 3
 
         while time.time() < deadline:
             count = self._assistant_count(page)
             if count > before_count:
                 saw_new = True
             text = self._last_assistant_text(page) if saw_new or count > 0 else ""
-            if text and text == previous:
+            generating = self._is_generating(page)
+            if generating:
+                stable = 0
+            elif text and text == previous:
                 stable += 1
             else:
                 stable = 0
             previous = text
-            # text unchanged across ~2s of polling => generation finished
-            if saw_new and text and stable >= 2:
+            if saw_new and text and not generating and stable >= need_stable:
                 return text
             time.sleep(1)
 
         if previous:
             logger.warning(
-                "answer wait ended with partial text chars=%s timeout_s=%s",
+                "answer wait ended with partial text chars=%s timeout_s=%s generating=%s",
                 len(previous),
                 timeout_s,
+                self._is_generating(page),
             )
             return previous
         logger.error("no answer within %ss", timeout_s)

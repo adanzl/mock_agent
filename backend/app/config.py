@@ -69,7 +69,14 @@ class Config:
         self.chrome_path: str | None = _opt("CHROME_PATH")
 
         # DeepSeek account / session
+        # Playwright UI action timeout (login/fill/click).
         self.deepseek_timeout_ms: int = int(os.getenv("DEEPSEEK_TIMEOUT_MS", "120000"))
+        # Default wait for a normal chat reply (seconds).
+        self.deepseek_chat_timeout_s: int = int(os.getenv("DEEPSEEK_CHAT_TIMEOUT_S", "300"))
+        # Wait for expert / deep-thinking replies (seconds).
+        self.deepseek_think_timeout_s: int = int(
+            os.getenv("DEEPSEEK_THINK_TIMEOUT_S", "600")
+        )
         self.deepseek_username: str | None = _opt("DEEPSEEK_USERNAME") or _opt(
             "DEEPSEEK_EMAIL"
         )
