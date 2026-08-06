@@ -1,0 +1,9 @@
+.env
+*.env.local
+backend/logs/
+backend/data/
+backend/startup.out
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.png

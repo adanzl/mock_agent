@@ -1,0 +1,15 @@
+{
+    "words": [
+        "Tailwind",
+        "Tailwindcss",
+        "deepseek",
+        "headless",
+        "playwright",
+        "dotenv",
+        "levelname",
+        "domcontentloaded",
+    ],
+    "ignorePaths": [
+        ".env"
+    ]
+}
