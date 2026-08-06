@@ -11,6 +11,11 @@
 密码 见.env 里的 SSH_PASSWORD
 优先级从上到下
 
+## 项目
+
+- 目录：/mnt/data/project/mock_agent
+- 服务 mock-agent
+
 ## Python 环境
 
 使用 **conda**，env: flask_env，不要再说本地没python了
