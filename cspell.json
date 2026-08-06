@@ -8,6 +8,8 @@
         "dotenv",
         "levelname",
         "domcontentloaded",
+        "pycache",
+        "pytest",
     ],
     "ignorePaths": [
         ".env"

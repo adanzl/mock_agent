@@ -39,7 +39,11 @@ class Config:
         self.reload()
 
     def reload(self) -> None:
-        load_dotenv(ROOT_DIR / ".env", override=True)
+        # override=False: process env (e.g. systemd Environment=) is
+        # authoritative; .env only fills in keys that are not already set.
+        # With override=True, a leftover .env PORT/HOST/ENV would silently
+        # clobber the systemd values on the server.
+        load_dotenv(ROOT_DIR / ".env")
 
         self.env: str = os.getenv("ENV", "development").strip().lower()
         self.is_production: bool = self.env == "production"

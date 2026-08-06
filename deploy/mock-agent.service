@@ -1,0 +1,23 @@
+# sudo cp deploy/mock-agent.service /etc/systemd/system/
+# 开启 sudo systemctl start mock-agent
+# 开机启动 sudo systemctl enable mock-agent
+
+[Unit]
+Description=MockAgent Server
+After=network.target
+
+[Service]
+Type=simple
+User=leo
+WorkingDirectory=/mnt/data/project/mock_agent/backend
+Environment="PATH=/home/leo/.conda/envs/flask_env/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PORT=9104"
+Environment="HOST=127.0.0.1"
+Environment="ENV=production"
+# 直接运行 Python 脚本
+ExecStart=/home/leo/.conda/envs/flask_env/bin/python /mnt/data/project/mock_agent/backend/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
