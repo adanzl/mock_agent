@@ -13,7 +13,7 @@ cd backend
 python main.py
 ```
 
-或在 Cursor 使用 launch 配置：`Python: Flask (后端)`。
+或在 Cursor 使用 launch 配置：`Python: Flask`。
 
 启动前在项目根目录 `.env` 配置账号与 Chrome 路径（见文末）。
 
@@ -63,7 +63,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
-|------|------|------|
+| --- | --- | --- |
 | GET | `/health` | 进程健康检查（根路径也有 `/health`） |
 | GET | `/api/deepseek/health` | DeepSeek 模块健康检查 |
 | GET | `/api/deepseek/status` | 登录态 / 浏览器状态 |
@@ -78,7 +78,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 ### 请求体
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
-|------|------|------|------|------|
+| --- | --- | --- | --- | --- |
 | `question` | string | 是 | — | 用户问题（别名：`prompt` / `message`） |
 | `conversation_id` | string | 否 | 无 | **有则续聊，无则新开**（别名：`chat_id`） |
 | `mode` | string | 否 | `instant` | 模式（别名：`model`） |
@@ -89,11 +89,14 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 ### `mode` 取值
 
 | 值 | 含义 |
-|----|------|
+| --- | --- |
 | `instant` / `fast` / `快速` / `快速模式` | 快速模式 |
 | `expert` / `专家` / `专家模式` | 专家模式 |
 
-说明：专家模式不支持 `search=true`，否则返回 400。
+说明：
+
+- 专家模式不支持 `search=true`，否则返回 400。
+- **模式只在新对话时生效**；带 `conversation_id` 续聊时不切换 `mode`，沿用该会话已有模式。
 
 ### 成功响应
 
@@ -113,7 +116,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 ### 错误码
 
 | HTTP | 含义 |
-|------|------|
+| --- | --- |
 | 400 | 参数错误（缺 question、非法 mode、专家+搜索等） |
 | 401 | 未登录 / 运行时失败 |
 | 504 | 等待回复超时 |
@@ -251,7 +254,7 @@ print(r2["answer"])
 ## 相关环境变量（`.env`）
 
 | 变量 | 说明 |
-|------|------|
+| --- | --- |
 | `HOST` / `PORT` | 服务监听，默认 `0.0.0.0:8765` |
 | `CHROME_PATH` | Chrome 可执行文件路径 |
 | `BROWSER_CHANNEL` | 默认 `chrome` |

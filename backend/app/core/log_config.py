@@ -10,6 +10,7 @@ from pathlib import Path
 _LOG_FORMAT = "%(asctime)s [%(levelname_fixed)s] %(name)s:%(lineno)d: %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 _CONFIGURED = False
+_SERVER_CONFIGURED = False
 
 
 class _AppLogFormatter(logging.Formatter):
@@ -68,7 +69,16 @@ def setup_server_logging(
     retention_days: int = 3,
 ) -> tuple[logging.Logger, logging.Logger]:
     """初始化 Web 服务日志：app + app.access（HTTP 访问日志）。"""
+    global _SERVER_CONFIGURED
     del is_production  # 与 video_factory 签名对齐，预留环境差异
+
+    app_logger = logging.getLogger("app")
+    access_logger = logging.getLogger("app.access")
+
+    # Prevent repeated init (same idea as setup_logging / DbMgr).
+    if _SERVER_CONFIGURED:
+        return app_logger, access_logger
+
     log_dir.mkdir(parents=True, exist_ok=True)
 
     formatter = _formatter()
@@ -76,27 +86,25 @@ def setup_server_logging(
     console.setFormatter(formatter)
     file_handler = _rotating_file_handler(log_dir / "app.log", retention_days=retention_days)
 
-    app_logger = logging.getLogger("app")
     app_logger.setLevel(logging.INFO)
     app_logger.propagate = False
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    # Flask/Werkzeug default access lines (GET /foo 404) are noisy in console.
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-    if not app_logger.handlers:
-        app_logger.addHandler(console)
-        app_logger.addHandler(file_handler)
-        app_logger.info("Server log: %s (rotating daily)", log_dir / "app.log")
+    app_logger.addHandler(console)
+    app_logger.addHandler(file_handler)
+    app_logger.info("Server log: %s (rotating daily)", log_dir / "app.log")
 
-    access_logger = logging.getLogger("app.access")
     access_logger.setLevel(logging.INFO)
     access_logger.propagate = False
+    access_handler = _rotating_file_handler(log_dir / "access.log", retention_days=retention_days)
+    access_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"),
+    )
+    access_logger.addHandler(access_handler)
 
-    if not access_logger.handlers:
-        access_handler = _rotating_file_handler(log_dir / "access.log", retention_days=retention_days)
-        access_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"),
-        )
-        access_logger.addHandler(access_handler)
-
+    _SERVER_CONFIGURED = True
     return app_logger, access_logger

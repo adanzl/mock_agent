@@ -2,12 +2,7 @@ import logging
 
 from flask import Blueprint, jsonify, request
 
-from app.repositories.database import (
-    get_conversation,
-    list_conversation_messages,
-    list_conversations,
-)
-from app.services.deepseek.client import get_client
+from app.services.deepseek.deepseek_mgr import deepseek_mgr
 
 bp = Blueprint("deepseek", __name__)
 logger = logging.getLogger(__name__)
@@ -28,9 +23,8 @@ def health():
 
 @bp.get("/status")
 def status():
-    client = get_client()
     try:
-        data = client.status()
+        data = deepseek_mgr.status()
         logger.info("status state=%s ready=%s", data.get("state"), data.get("ready"))
         return jsonify({"ok": True, **data})
     except Exception as exc:
@@ -42,7 +36,7 @@ def status():
 def conversations():
     limit = request.args.get("limit", 50)
     try:
-        items = list_conversations(provider="deepseek", limit=int(limit))
+        items = deepseek_mgr.list_conversations(provider="deepseek", limit=int(limit))
         return jsonify({"ok": True, "items": items})
     except Exception as exc:
         logger.exception("list conversations failed: %s", exc)
@@ -52,10 +46,10 @@ def conversations():
 @bp.get("/conversations/<conversation_id>")
 def conversation_detail(conversation_id: str):
     try:
-        item = get_conversation(conversation_id)
+        item = deepseek_mgr.get_conversation(conversation_id)
         if item is None:
             return jsonify({"ok": False, "error": "conversation not found"}), 404
-        messages = list_conversation_messages(conversation_id)
+        messages = deepseek_mgr.list_conversation_messages(conversation_id)
         return jsonify({"ok": True, "conversation": item, "messages": messages})
     except Exception as exc:
         logger.exception("conversation detail failed: %s", exc)
@@ -91,9 +85,8 @@ def chat():
         len(str(question)),
         preview,
     )
-    client = get_client()
     try:
-        result = client.ask(
+        result = deepseek_mgr.ask(
             str(question),
             conversation_id=str(conversation_id) if conversation_id else None,
             mode=str(mode),

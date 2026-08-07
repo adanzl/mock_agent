@@ -19,9 +19,9 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     from app.api.api_deepseek import bp as deepseek_bp
-    from app.repositories.database import init_database
+    from app.repositories.database import db_mgr
 
-    init_database()
+    db_mgr.init()
     app.register_blueprint(deepseek_bp, url_prefix="/api/deepseek")
 
     @app.before_request

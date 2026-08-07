@@ -1,4 +1,4 @@
-"""SQLite 本地存储：data.db。"""
+"""SQLite 本地存储：data.db。仿造 my_todo DbMgr 单例。"""
 
 from __future__ import annotations
 
@@ -48,204 +48,208 @@ CREATE INDEX IF NOT EXISTS idx_conversation_message_conv
 ON conversation_message(conversation_id, id);
 """
 
-_lock = threading.Lock()
-_initialized = False
 
+class DbMgr:
+    """数据库管理：进程内单例，schema 只初始化一次。"""
 
-def sqlite_path() -> Path:
-    return config.sqlite_path
+    def __init__(self) -> None:
+        self._initialized = False
+        self._lock = threading.Lock()
 
+    def path(self) -> Path:
+        return config.sqlite_path
 
-def connect() -> sqlite3.Connection:
-    path = sqlite_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def init_database() -> Path:
-    global _initialized
-    with _lock:
-        path = sqlite_path()
+    def connect(self) -> sqlite3.Connection:
+        path = self.path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with connect() as conn:
-            conn.executescript(_SCHEMA)
-            conn.commit()
-        _initialized = True
-        logger.info("sqlite ready path=%s", path)
-        return path
+        conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
+    def init(self) -> Path:
+        """初始化 schema；已初始化则直接返回路径。"""
+        with self._lock:
+            if self._initialized:
+                return self.path()
 
-def get_browser_session(provider: str) -> dict[str, Any] | None:
-    init_database()
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT storage_state FROM browser_session WHERE provider = ?",
-            (provider,),
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        data = json.loads(row["storage_state"])
-    except json.JSONDecodeError:
-        logger.warning("invalid storage_state for provider=%s", provider)
-        return None
-    return data if isinstance(data, dict) else None
+            path = self.path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self.connect() as conn:
+                conn.executescript(_SCHEMA)
+                conn.commit()
+            self._initialized = True
+            logger.info("sqlite ready path=%s", path)
+            return path
 
+    def get_browser_session(self, provider: str) -> dict[str, Any] | None:
+        self.init()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT storage_state FROM browser_session WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row["storage_state"])
+        except json.JSONDecodeError:
+            logger.warning("invalid storage_state for provider=%s", provider)
+            return None
+        return data if isinstance(data, dict) else None
 
-def save_browser_session(provider: str, storage_state: dict[str, Any]) -> None:
-    init_database()
-    payload = json.dumps(storage_state, ensure_ascii=False)
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO browser_session (provider, storage_state, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(provider) DO UPDATE SET
-                storage_state = excluded.storage_state,
-                updated_at = datetime('now')
-            """,
-            (provider, payload),
-        )
-        conn.commit()
-    logger.info("browser_session saved provider=%s bytes=%s", provider, len(payload))
-
-
-def has_browser_session(provider: str) -> bool:
-    return get_browser_session(provider) is not None
-
-
-def delete_browser_session(provider: str) -> None:
-    init_database()
-    with connect() as conn:
-        conn.execute("DELETE FROM browser_session WHERE provider = ?", (provider,))
-        conn.commit()
-
-
-def upsert_conversation(
-    *,
-    conversation_id: str,
-    provider: str = "deepseek",
-    title: str | None = None,
-    mode: str | None = None,
-    deep_thinking: bool = False,
-    search: bool = False,
-    url: str | None = None,
-) -> None:
-    init_database()
-    with connect() as conn:
-        existing = conn.execute(
-            "SELECT id, title FROM conversation WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-        if existing is None:
+    def save_browser_session(self, provider: str, storage_state: dict[str, Any]) -> None:
+        self.init()
+        payload = json.dumps(storage_state, ensure_ascii=False)
+        with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO conversation (
-                    id, provider, title, mode, deep_thinking, search, url, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                """,
-                (
-                    conversation_id,
-                    provider,
-                    title,
-                    mode,
-                    1 if deep_thinking else 0,
-                    1 if search else 0,
-                    url,
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE conversation
-                SET title = COALESCE(?, title),
-                    mode = COALESCE(?, mode),
-                    deep_thinking = ?,
-                    search = ?,
-                    url = COALESCE(?, url),
+                INSERT INTO browser_session (provider, storage_state, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(provider) DO UPDATE SET
+                    storage_state = excluded.storage_state,
                     updated_at = datetime('now')
-                WHERE id = ?
                 """,
-                (
-                    title,
-                    mode,
-                    1 if deep_thinking else 0,
-                    1 if search else 0,
-                    url,
-                    conversation_id,
-                ),
+                (provider, payload),
             )
-        conn.commit()
+            conn.commit()
+        logger.info("browser_session saved provider=%s bytes=%s", provider, len(payload))
+
+    def has_browser_session(self, provider: str) -> bool:
+        return self.get_browser_session(provider) is not None
+
+    def delete_browser_session(self, provider: str) -> None:
+        self.init()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM browser_session WHERE provider = ?", (provider,))
+            conn.commit()
+
+    def upsert_conversation(
+        self,
+        *,
+        conversation_id: str,
+        provider: str = "deepseek",
+        title: str | None = None,
+        mode: str | None = None,
+        deep_thinking: bool = False,
+        search: bool = False,
+        url: str | None = None,
+    ) -> None:
+        self.init()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id, title FROM conversation WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO conversation (
+                        id, provider, title, mode, deep_thinking, search, url, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    """,
+                    (
+                        conversation_id,
+                        provider,
+                        title,
+                        mode,
+                        1 if deep_thinking else 0,
+                        1 if search else 0,
+                        url,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE conversation
+                    SET title = COALESCE(?, title),
+                        mode = COALESCE(?, mode),
+                        deep_thinking = ?,
+                        search = ?,
+                        url = COALESCE(?, url),
+                        updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (
+                        title,
+                        mode,
+                        1 if deep_thinking else 0,
+                        1 if search else 0,
+                        url,
+                        conversation_id,
+                    ),
+                )
+            conn.commit()
+
+    def add_conversation_messages(
+        self,
+        conversation_id: str,
+        messages: list[tuple[str, str]],
+    ) -> None:
+        """messages: list of (role, content)."""
+        if not messages:
+            return
+        self.init()
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO conversation_message (conversation_id, role, content)
+                VALUES (?, ?, ?)
+                """,
+                [(conversation_id, role, content) for role, content in messages],
+            )
+            conn.execute(
+                "UPDATE conversation SET updated_at = datetime('now') WHERE id = ?",
+                (conversation_id,),
+            )
+            conn.commit()
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM conversation WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def list_conversations(
+        self, provider: str = "deepseek", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM conversation
+                WHERE provider = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (provider, max(1, min(limit, 200))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_conversation_messages(
+        self,
+        conversation_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM conversation_message
+                WHERE conversation_id = ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (conversation_id, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
-def add_conversation_messages(
-    conversation_id: str,
-    messages: list[tuple[str, str]],
-) -> None:
-    """messages: list of (role, content)."""
-    if not messages:
-        return
-    init_database()
-    with connect() as conn:
-        conn.executemany(
-            """
-            INSERT INTO conversation_message (conversation_id, role, content)
-            VALUES (?, ?, ?)
-            """,
-            [(conversation_id, role, content) for role, content in messages],
-        )
-        conn.execute(
-            "UPDATE conversation SET updated_at = datetime('now') WHERE id = ?",
-            (conversation_id,),
-        )
-        conn.commit()
-
-
-def get_conversation(conversation_id: str) -> dict[str, Any] | None:
-    init_database()
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM conversation WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-    if row is None:
-        return None
-    return dict(row)
-
-
-def list_conversations(provider: str = "deepseek", limit: int = 50) -> list[dict[str, Any]]:
-    init_database()
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM conversation
-            WHERE provider = ?
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (provider, max(1, min(limit, 200))),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def list_conversation_messages(
-    conversation_id: str,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    init_database()
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, role, content, created_at
-            FROM conversation_message
-            WHERE conversation_id = ?
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (conversation_id, max(1, min(limit, 1000))),
-        ).fetchall()
-    return [dict(r) for r in rows]
+db_mgr = DbMgr()

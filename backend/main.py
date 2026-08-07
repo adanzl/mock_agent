@@ -12,7 +12,7 @@ os.chdir(BACKEND_DIR)
 
 from app import app_logger, create_app
 from app.config import config
-from app.services.deepseek.client import get_client
+from app.services.deepseek.deepseek_mgr import deepseek_mgr
 
 log = app_logger
 app = create_app()
@@ -20,7 +20,7 @@ app = create_app()
 
 def _bootstrap_deepseek() -> None:
     try:
-        result = get_client().ensure_ready()
+        result = deepseek_mgr.ensure_ready()
         log.info(
             "deepseek ready state=%s session_saved=%s",
             result.get("state"),
@@ -45,7 +45,7 @@ threading.Thread(
 @atexit.register
 def _shutdown_browser() -> None:
     try:
-        get_client().stop()
+        deepseek_mgr.stop()
     except Exception:
         pass
 

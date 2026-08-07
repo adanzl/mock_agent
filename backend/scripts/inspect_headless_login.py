@@ -3,12 +3,21 @@
 No storage_state is loaded (fresh context), so this exercises the real
 headless login path the Linux/headless deployment would take. Reports what
 happens after login submit: reaches chat textarea, captcha wall, or error.
+
+用法:
+  cd backend
+  python -m scripts.inspect_headless_login
 """
+
+from __future__ import annotations
+
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # backend/
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from playwright.sync_api import sync_playwright
 

@@ -12,15 +12,7 @@ from typing import Any, Callable
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
 from app.config import config
-from app.repositories.database import (
-    add_conversation_messages,
-    get_browser_session,
-    get_conversation,
-    has_browser_session,
-    save_browser_session,
-    sqlite_path,
-    upsert_conversation,
-)
+from app.repositories.database import db_mgr
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +135,8 @@ class DeepSeekClient:
             "url": "",
             "headless": self.headless,
             "browser": self._browser_info or self.browser_channel,
-            "sqlite_path": str(sqlite_path()),
-            "session_saved": has_browser_session(PROVIDER),
+            "sqlite_path": str(db_mgr.path()),
+            "session_saved": db_mgr.has_browser_session(PROVIDER),
         }
 
     def _refresh_last_status(self) -> None:
@@ -157,8 +149,8 @@ class DeepSeekClient:
             "url": self._page.url,
             "headless": self.headless,
             "browser": self._browser_info or self.browser_channel,
-            "sqlite_path": str(sqlite_path()),
-            "session_saved": has_browser_session(PROVIDER),
+            "sqlite_path": str(db_mgr.path()),
+            "session_saved": db_mgr.has_browser_session(PROVIDER),
         }
 
     def start(self) -> None:
@@ -215,7 +207,7 @@ class DeepSeekClient:
             "ready": True,
             "state": state,
             "url": page.url,
-            "session_saved": has_browser_session(PROVIDER),
+            "session_saved": db_mgr.has_browser_session(PROVIDER),
         }
 
     def ask(
@@ -294,7 +286,7 @@ class DeepSeekClient:
             if not self._ensure_logged_in(page):
                 raise RuntimeError(
                     "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env "
-                    f"(sqlite={sqlite_path()})"
+                    f"(sqlite={db_mgr.path()})"
                 )
             state = self._detect_shell_state(page)
 
@@ -314,11 +306,13 @@ class DeepSeekClient:
         else:
             self._open_new_chat(page)
 
-        self._apply_chat_options(
+        # Mode is fixed once a conversation exists; only switch on new chats.
+        mode = self._apply_chat_options(
             page,
             mode=mode,
             deep_thinking=deep_thinking,
             search=search,
+            switch_mode=not bool(conversation_id),
         )
 
         before = self._assistant_count(page)
@@ -332,7 +326,7 @@ class DeepSeekClient:
             raise RuntimeError("conversation_id missing after reply; DeepSeek URL has no chat id")
 
         title = question.replace("\n", " ").strip()[:40] or None
-        upsert_conversation(
+        db_mgr.upsert_conversation(
             conversation_id=conv_id,
             provider=PROVIDER,
             title=title if not conversation_id else None,
@@ -341,7 +335,7 @@ class DeepSeekClient:
             search=search,
             url=page.url,
         )
-        add_conversation_messages(
+        db_mgr.add_conversation_messages(
             conv_id,
             [("user", question), ("assistant", answer)],
         )
@@ -380,46 +374,60 @@ class DeepSeekClient:
         mode: str,
         deep_thinking: bool,
         search: bool,
-    ) -> None:
-        self._select_mode(page, mode)
+        switch_mode: bool = True,
+    ) -> str:
+        """Apply mode/toggles. Returns the mode actually in effect."""
+        if switch_mode:
+            actual_mode = self._select_mode(page, mode)
+        else:
+            actual_mode = self._detect_current_mode(page) or mode
         self._set_feature_toggle(page, index=0, enabled=deep_thinking, label="deep_thinking")
-        if mode == "instant":
+        if actual_mode == "instant":
             self._set_feature_toggle(page, index=1, enabled=search, label="search")
         elif search:
             logger.warning("search ignored in expert mode")
+        return actual_mode
 
-    def _select_mode(self, page: Page, mode: str) -> None:
-        index = 0 if mode == "instant" else 1
-        result = page.evaluate(
-            """(index) => {
-                const radios = document.querySelectorAll('div[role="radio"]');
-                if (!radios.length || index >= radios.length) return { ok: false };
-                const target = radios[index];
-                const already = target.getAttribute('aria-checked') === 'true';
-                if (!already) target.click();
-                return { ok: true, toggled: !already };
-            }""",
-            index,
+    def _detect_current_mode(self, page: Page) -> str | None:
+        """Read selected mode from radios or conversation header badge."""
+        return page.evaluate(
+            """() => {
+                const radios = Array.from(document.querySelectorAll('[role="radio"]'));
+                for (const radio of radios) {
+                    if (radio.getAttribute('aria-checked') !== 'true') continue;
+                    const text = (radio.innerText || '').trim();
+                    if (/专家|Expert/i.test(text)) return 'expert';
+                    if (/快速|Instant/i.test(text)) return 'instant';
+                }
+                const header = document.querySelector('.the-header');
+                const text = header ? (header.innerText || '') : '';
+                if (/专家模式|Expert/i.test(text)) return 'expert';
+                if (/快速模式|Instant/i.test(text)) return 'instant';
+                return null;
+            }"""
         )
-        if not result or not result.get("ok"):
-            # fallback by visible text
-            labels = (
-                ["快速", "Instant", "快速模式"]
-                if mode == "instant"
-                else ["专家", "Expert", "专家模式"]
+
+    def _select_mode(self, page: Page, mode: str) -> str:
+        """Select chat mode on new-chat page (radios). Returns mode in effect."""
+        labels = (
+            ["快速模式", "快速", "Instant"]
+            if mode == "instant"
+            else ["专家模式", "专家", "Expert"]
+        )
+        for label in labels:
+            loc = page.locator(
+                f'[role="radiogroup"] [role="radio"]:has-text("{label}"), '
+                f'div[role="radio"]:has-text("{label}")'
             )
-            clicked = False
-            for label in labels:
-                loc = page.locator(f'div[role="radio"]:has-text("{label}")')
-                if loc.count() > 0:
-                    loc.first.click()
-                    clicked = True
-                    break
-            if not clicked:
-                logger.warning("mode radio not found mode=%s", mode)
-                return
-        logger.info("mode set to %s", mode)
-        time.sleep(0.3)
+            if loc.count() == 0:
+                continue
+            target = loc.first
+            if target.get_attribute("aria-checked") != "true":
+                target.click()
+            logger.info("mode set to %s", mode)
+            time.sleep(0.3)
+            return mode
+        return self._detect_current_mode(page) or mode
 
     def _set_feature_toggle(
         self,
@@ -484,7 +492,7 @@ class DeepSeekClient:
         ):
             raise ValueError(f"invalid conversation_id: {conversation_id}")
 
-        record = get_conversation(conv)
+        record = db_mgr.get_conversation(conv)
         target = (record or {}).get("url") or f"{CHAT_URL.rstrip('/')}/a/chat/s/{conv}"
         if self._conversation_id_from_url(page.url) == conv:
             logger.info("already on conversation id=%s", conv)
@@ -562,7 +570,7 @@ class DeepSeekClient:
             "viewport": {"width": 1280, "height": 900},
             "locale": "zh-CN",
         }
-        stored = get_browser_session(PROVIDER)
+        stored = db_mgr.get_browser_session(PROVIDER)
         if stored:
             context_kwargs["storage_state"] = stored
             logger.info("load storage_state from sqlite provider=%s", PROVIDER)
@@ -705,7 +713,7 @@ class DeepSeekClient:
         if self._context is None:
             return
         state = self._context.storage_state()
-        save_browser_session(PROVIDER, state)
+        db_mgr.save_browser_session(PROVIDER, state)
 
     def _has_visible(self, page: Page, selectors: list[str]) -> bool:
         for selector in selectors:

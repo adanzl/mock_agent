@@ -1,0 +1,10 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "remote.portsAttributes": {
+        "8765": {
+            "label": "mock_agent",
+            "onAutoForward": "silent"
+        }
+    }
+}
