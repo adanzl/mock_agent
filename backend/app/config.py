@@ -69,6 +69,8 @@ class Config:
         self.chrome_path: str | None = _opt("CHROME_PATH")
 
         # DeepSeek account / session
+        # Master switch — on by default.
+        self.deepseek_enabled: bool = _bool("DEEPSEEK_ENABLED", True)
         # Playwright UI action timeout (login/fill/click).
         self.deepseek_timeout_ms: int = int(os.getenv("DEEPSEEK_TIMEOUT_MS", "120000"))
         # Default wait for a normal chat reply (seconds).
@@ -82,6 +84,39 @@ class Config:
         )
         self.deepseek_password: str | None = _opt("DEEPSEEK_PASSWORD")
         self.deepseek_auto_login: bool = _bool("DEEPSEEK_AUTO_LOGIN", True)
+
+        # ChatGPT account / session (browser via local proxy)
+        # Master switch — off by default; set CHATGPT_ENABLED=1 to use GPT.
+        self.chatgpt_enabled: bool = _bool("CHATGPT_ENABLED", False)
+        self.chatgpt_proxy: str = (
+            os.getenv("CHATGPT_PROXY", "http://127.0.0.1:7890").strip()
+            or "http://127.0.0.1:7890"
+        )
+        self.chatgpt_timeout_ms: int = int(os.getenv("CHATGPT_TIMEOUT_MS", "120000"))
+        self.chatgpt_chat_timeout_s: int = int(
+            os.getenv("CHATGPT_CHAT_TIMEOUT_S", "300")
+        )
+        self.chatgpt_username: str | None = _opt("CHATGPT_USERNAME") or _opt(
+            "CHATGPT_EMAIL"
+        )
+        self.chatgpt_password: str | None = _opt("CHATGPT_PASSWORD")
+        # Manual login (headed browser, user completes auth). Default on.
+        self.chatgpt_manual_login: bool = _bool("CHATGPT_MANUAL_LOGIN", True)
+        # Password auto-fill only when CHATGPT_MANUAL_LOGIN=0.
+        self.chatgpt_auto_login: bool = _bool("CHATGPT_AUTO_LOGIN", False)
+        # Wait for manual login / Cloudflare / 真人验证 (seconds).
+        self.chatgpt_captcha_timeout_s: int = int(
+            os.getenv("CHATGPT_CAPTCHA_TIMEOUT_S", "600")
+        )
+        # Persistent Chrome profile reduces repeated human checks.
+        self.chatgpt_user_data_dir: Path = _path(
+            "CHATGPT_USER_DATA_DIR",
+            BACKEND_DIR / "data" / "chatgpt-browser",
+            root=BACKEND_DIR,
+        )
+        # Attach to a real Chrome via CDP (recommended for manual login).
+        # Example: http://127.0.0.1:9222
+        self.chatgpt_cdp_url: str | None = _opt("CHATGPT_CDP_URL")
 
 
 config = Config()

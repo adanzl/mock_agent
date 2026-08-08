@@ -3,9 +3,9 @@ import logging
 from flask import Blueprint, jsonify, request
 
 from app.config import config
-from app.services.deepseek.deepseek_mgr import deepseek_mgr
+from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
 
-bp = Blueprint("deepseek", __name__)
+bp = Blueprint("chatgpt", __name__)
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +23,7 @@ def _disabled_response():
             {
                 "ok": False,
                 "enabled": False,
-                "error": "deepseek disabled; set DEEPSEEK_ENABLED=1 in .env",
+                "error": "chatgpt disabled; set CHATGPT_ENABLED=1 in .env",
             }
         ),
         503,
@@ -35,15 +35,15 @@ def health():
     return jsonify(
         {
             "ok": True,
-            "service": "deepseek",
-            "enabled": bool(config.deepseek_enabled),
+            "service": "chatgpt",
+            "enabled": bool(config.chatgpt_enabled),
         }
     )
 
 
 @bp.get("/status")
 def status():
-    if not config.deepseek_enabled:
+    if not config.chatgpt_enabled:
         return jsonify(
             {
                 "ok": True,
@@ -53,7 +53,7 @@ def status():
             }
         )
     try:
-        data = deepseek_mgr.status()
+        data = chatgpt_mgr.status()
         logger.info("status state=%s ready=%s", data.get("state"), data.get("ready"))
         return jsonify({"ok": True, "enabled": True, **data})
     except Exception as exc:
@@ -63,11 +63,11 @@ def status():
 
 @bp.get("/conversations")
 def conversations():
-    if not config.deepseek_enabled:
+    if not config.chatgpt_enabled:
         return _disabled_response()
     limit = request.args.get("limit", 50)
     try:
-        items = deepseek_mgr.list_conversations(provider="deepseek", limit=int(limit))
+        items = chatgpt_mgr.list_conversations(provider="chatgpt", limit=int(limit))
         return jsonify({"ok": True, "items": items})
     except Exception as exc:
         logger.exception("list conversations failed: %s", exc)
@@ -76,13 +76,13 @@ def conversations():
 
 @bp.get("/conversations/<conversation_id>")
 def conversation_detail(conversation_id: str):
-    if not config.deepseek_enabled:
+    if not config.chatgpt_enabled:
         return _disabled_response()
     try:
-        item = deepseek_mgr.get_conversation(conversation_id)
+        item = chatgpt_mgr.get_conversation(conversation_id)
         if item is None:
             return jsonify({"ok": False, "error": "conversation not found"}), 404
-        messages = deepseek_mgr.list_conversation_messages(conversation_id)
+        messages = chatgpt_mgr.list_conversation_messages(conversation_id)
         return jsonify({"ok": True, "conversation": item, "messages": messages})
     except Exception as exc:
         logger.exception("conversation detail failed: %s", exc)
@@ -91,7 +91,7 @@ def conversation_detail(conversation_id: str):
 
 @bp.post("/chat")
 def chat():
-    if not config.deepseek_enabled:
+    if not config.chatgpt_enabled:
         return _disabled_response()
 
     payload = request.get_json(silent=True) or {}
@@ -99,9 +99,8 @@ def chat():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    # 无 conversation_id = 新对话；有 conversation_id = 多轮续聊
     conversation_id = payload.get("conversation_id") or payload.get("chat_id")
-    mode = payload.get("mode") or payload.get("model") or "instant"
+    mode = payload.get("mode") or payload.get("model") or "auto"
     deep_thinking = _as_bool(
         payload.get("deep_thinking", payload.get("think", payload.get("deep_think"))),
         False,
@@ -121,7 +120,7 @@ def chat():
         question,
     )
     try:
-        result = deepseek_mgr.ask(
+        result = chatgpt_mgr.ask(
             str(question),
             conversation_id=str(conversation_id) if conversation_id else None,
             mode=str(mode),

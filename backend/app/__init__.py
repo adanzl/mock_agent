@@ -18,11 +18,13 @@ log = app_logger
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    from app.api.api_chatgpt import bp as chatgpt_bp
     from app.api.api_deepseek import bp as deepseek_bp
     from app.repositories.database import db_mgr
 
     db_mgr.init()
     app.register_blueprint(deepseek_bp, url_prefix="/api/deepseek")
+    app.register_blueprint(chatgpt_bp, url_prefix="/api/chatgpt")
 
     @app.before_request
     def _record_request_start_time():

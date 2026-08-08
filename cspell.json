@@ -3,6 +3,7 @@
         "Tailwind",
         "Tailwindcss",
         "deepseek",
+        "chatgpt",
         "headless",
         "playwright",
         "dotenv",
@@ -11,6 +12,11 @@
         "pycache",
         "pytest",
         "infobars",
+        "openai",
+        "contenteditable",
+        "turnstile",
+        "captcha",
+        "cdp",
     ],
     "ignorePaths": [
         ".env"

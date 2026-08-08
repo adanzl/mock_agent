@@ -260,6 +260,7 @@ print(r2["answer"])
 | `BROWSER_CHANNEL` | 默认 `chrome` |
 | `HEADLESS` | `1` 无头 / `0` 有界面 |
 | `SQLITE_PATH` | 默认 `data/data.db` |
+| `DEEPSEEK_ENABLED` | 总开关，默认 `1`（开启）；设为 `0` 可关闭 |
 | `DEEPSEEK_USERNAME` / `DEEPSEEK_PASSWORD` | 网页登录账号 |
 | `DEEPSEEK_AUTO_LOGIN` | 是否自动填表登录 |
 | `DEEPSEEK_TIMEOUT_MS` | Playwright 页面操作超时（登录/点击等），默认 120000 |
