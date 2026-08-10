@@ -4,6 +4,7 @@ from flask import Blueprint, jsonify, request
 
 from app.config import config
 from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
+from app.services.chat_jobs.job_mgr import chat_job_mgr
 
 bp = Blueprint("chatgpt", __name__)
 logger = logging.getLogger(__name__)
@@ -148,4 +149,68 @@ def chat():
         return jsonify({"ok": False, "error": str(exc)}), 504
     except Exception as exc:
         logger.exception("chat failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@bp.post("/chat/async")
+def chat_async():
+    if not config.chatgpt_enabled:
+        return _disabled_response()
+
+    payload = request.get_json(silent=True) or {}
+    question = payload.get("question") or payload.get("prompt") or payload.get("message")
+    if not question:
+        return jsonify({"ok": False, "error": "question is required"}), 400
+
+    conversation_id = payload.get("conversation_id") or payload.get("chat_id")
+    mode = payload.get("mode") or payload.get("model") or "auto"
+    deep_thinking = _as_bool(
+        payload.get("deep_thinking", payload.get("think", payload.get("deep_think"))),
+        False,
+    )
+    search = _as_bool(
+        payload.get("search", payload.get("web_search", payload.get("smart_search"))),
+        False,
+    )
+    timeout_s = payload.get("timeout")
+    try:
+        job = chat_job_mgr.create(
+            provider="chatgpt",
+            question=str(question),
+            conversation_id=str(conversation_id) if conversation_id else None,
+            mode=str(mode),
+            deep_thinking=deep_thinking,
+            search=search,
+            timeout_s=int(timeout_s) if timeout_s is not None else None,
+        )
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "job_id": job.get("id"),
+                    "status": job.get("status"),
+                    "provider": "chatgpt",
+                }
+            ),
+            202,
+        )
+    except ValueError as exc:
+        logger.warning("chat async bad request: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("chat async failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@bp.get("/chat/jobs/<job_id>")
+def chat_job_detail(job_id: str):
+    if not config.chatgpt_enabled:
+        return _disabled_response()
+    try:
+        job = chat_job_mgr.get(job_id, provider="chatgpt")
+        if job is None:
+            return jsonify({"ok": False, "error": "job not found"}), 404
+        return jsonify(chat_job_mgr.to_api_payload(job))
+    except Exception as exc:
+        logger.exception("chat job detail failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500

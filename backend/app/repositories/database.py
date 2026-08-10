@@ -46,6 +46,31 @@ CREATE TABLE IF NOT EXISTS conversation_message (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_message_conv
 ON conversation_message(conversation_id, id);
+
+CREATE TABLE IF NOT EXISTS chat_job (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    question TEXT NOT NULL,
+    conversation_id TEXT,
+    mode TEXT,
+    deep_thinking INTEGER NOT NULL DEFAULT 0,
+    search INTEGER NOT NULL DEFAULT 0,
+    timeout_s INTEGER,
+    result_json TEXT,
+    error TEXT,
+    error_kind TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_job_provider_status_created
+ON chat_job(provider, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_chat_job_provider_created
+ON chat_job(provider, created_at DESC);
 """
 
 
@@ -250,6 +275,176 @@ class DbMgr:
                 (conversation_id, max(1, min(limit, 1000))),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_chat_job(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["deep_thinking"] = bool(item.get("deep_thinking"))
+        item["search"] = bool(item.get("search"))
+        raw = item.pop("result_json", None)
+        result = None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    result = parsed
+            except json.JSONDecodeError:
+                logger.warning("invalid chat_job result_json id=%s", item.get("id"))
+        item["result"] = result
+        return item
+
+    def create_chat_job(
+        self,
+        *,
+        job_id: str,
+        provider: str,
+        question: str,
+        conversation_id: str | None = None,
+        mode: str | None = None,
+        deep_thinking: bool = False,
+        search: bool = False,
+        timeout_s: int | None = None,
+    ) -> dict[str, Any]:
+        self.init()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_job (
+                    id, provider, status, question, conversation_id, mode,
+                    deep_thinking, search, timeout_s, updated_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    job_id,
+                    provider,
+                    question,
+                    conversation_id,
+                    mode,
+                    1 if deep_thinking else 0,
+                    1 if search else 0,
+                    timeout_s,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM chat_job WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        assert row is not None
+        return self._row_to_chat_job(row)
+
+    def get_chat_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_job WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_chat_job(row)
+
+    def claim_next_chat_job(self) -> dict[str, Any] | None:
+        """Atomically claim the oldest queued job (status queued -> running)."""
+        self.init()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM chat_job
+                WHERE status = 'queued'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = row["id"]
+            cur = conn.execute(
+                """
+                UPDATE chat_job
+                SET status = 'running',
+                    started_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE id = ? AND status = 'queued'
+                """,
+                (job_id,),
+            )
+            if cur.rowcount != 1:
+                conn.commit()
+                return None
+            conn.commit()
+            claimed = conn.execute(
+                "SELECT * FROM chat_job WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if claimed is None:
+            return None
+        return self._row_to_chat_job(claimed)
+
+    def finish_chat_job_success(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        self.init()
+        payload = json.dumps(result, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE chat_job
+                SET status = 'succeeded',
+                    result_json = ?,
+                    error = NULL,
+                    error_kind = NULL,
+                    finished_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (payload, job_id),
+            )
+            conn.commit()
+
+    def finish_chat_job_failure(
+        self,
+        job_id: str,
+        *,
+        error: str,
+        error_kind: str,
+    ) -> None:
+        self.init()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE chat_job
+                SET status = 'failed',
+                    error = ?,
+                    error_kind = ?,
+                    finished_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (error, error_kind, job_id),
+            )
+            conn.commit()
+
+    def fail_running_chat_jobs(self, *, error: str = "interrupted by process restart") -> int:
+        """Mark leftover running jobs as failed (e.g. after restart)."""
+        self.init()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE chat_job
+                SET status = 'failed',
+                    error = ?,
+                    error_kind = 'other',
+                    finished_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE status = 'running'
+                """,
+                (error,),
+            )
+            conn.commit()
+            return int(cur.rowcount)
 
 
 db_mgr = DbMgr()

@@ -13,11 +13,15 @@ os.chdir(BACKEND_DIR)
 from app import app_logger, create_app
 from app.config import config
 from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
+from app.services.chat_jobs.runner import chat_job_runner
 from app.services.deepseek.deepseek_mgr import deepseek_mgr
 from app.services.qwen.qwen_mgr import qwen_mgr
 
 log = app_logger
 app = create_app()
+
+# Async chat job worker (shared across providers).
+chat_job_runner.start()
 
 
 def _bootstrap_deepseek() -> None:
@@ -139,6 +143,10 @@ threading.Thread(
 
 @atexit.register
 def _shutdown_browser() -> None:
+    try:
+        chat_job_runner.stop()
+    except Exception:
+        pass
     try:
         deepseek_mgr.stop()
     except Exception:

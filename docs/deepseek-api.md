@@ -67,7 +67,9 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | GET | `/health` | 进程健康检查（根路径也有 `/health`） |
 | GET | `/api/deepseek/health` | DeepSeek 模块健康检查 |
 | GET | `/api/deepseek/status` | 登录态 / 浏览器状态 |
-| POST | `/api/deepseek/chat` | 提问（新对话或按 `conversation_id` 续聊） |
+| POST | `/api/deepseek/chat` | 提问（同步，长内容易被网关超时掐断） |
+| POST | `/api/deepseek/chat/async` | 异步提问（立即返回 `job_id`） |
+| GET | `/api/deepseek/chat/jobs/<id>` | 查询异步任务状态 / 结果 |
 | GET | `/api/deepseek/conversations` | 本地会话列表 |
 | GET | `/api/deepseek/conversations/<id>` | 会话详情 + 消息历史 |
 
@@ -124,6 +126,69 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | 401 | 未登录 / 运行时失败 |
 | 504 | 等待回复超时 |
 | 500 | 其他异常 |
+
+---
+
+## 异步 Chat（推荐长内容）
+
+长回复 / 专家模式 / 深度思考容易超过客户端或网关 HTTP 超时。异步接口提交后立即返回，再轮询结果。
+
+### 1. 提交
+
+`POST /api/deepseek/chat/async`
+
+请求体与同步 `/chat` 相同。
+
+```bash
+curl -s http://127.0.0.1:8765/api/deepseek/chat/async \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"写一篇较长的说明\",\"mode\":\"expert\",\"deep_thinking\":true}"
+```
+
+响应 `202`：
+
+```json
+{
+  "ok": true,
+  "job_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "status": "queued",
+  "provider": "deepseek"
+}
+```
+
+### 2. 轮询
+
+`GET /api/deepseek/chat/jobs/<job_id>`
+
+`status`：`queued` / `running` / `succeeded` / `failed`。
+
+成功时响应含 `result`（结构与同步 `/chat` 成功体相同）；失败时含 `error` / `error_kind`（`value` / `runtime` / `timeout` / `other`）。
+
+Python 轮询示例：
+
+```python
+import time
+import requests
+
+BASE = "http://127.0.0.1:8765/api/deepseek"
+r = requests.post(
+    f"{BASE}/chat/async",
+    json={"question": "你好", "mode": "instant"},
+    timeout=30,
+)
+r.raise_for_status()
+job_id = r.json()["job_id"]
+
+while True:
+    j = requests.get(f"{BASE}/chat/jobs/{job_id}", timeout=30).json()
+    status = j.get("status")
+    if status == "succeeded":
+        print(j["result"]["answer"])
+        break
+    if status == "failed":
+        raise RuntimeError(j.get("error"))
+    time.sleep(2)
+```
 
 ---
 
