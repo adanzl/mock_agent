@@ -273,18 +273,18 @@ while True:
 
 1. 先关掉所有 Chrome，再启动调试 Chrome（系统 Chrome，不要用 `chrome-win64` 便携包）：
 
-```bat
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%TEMP%\chrome-chatgpt-debug"
-```
+   ```bat
+   "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%TEMP%\chrome-chatgpt-debug"
+   ```
 
 2. 在该窗口打开 chatgpt.com，**手动登录成功**（代理用你平时能上的方式）。
 
 3. `.env` 设置：
 
-```
-CHATGPT_CDP_URL=http://127.0.0.1:9222
-CHATGPT_MANUAL_LOGIN=1
-```
+   ```env
+   CHATGPT_CDP_URL=http://127.0.0.1:9222
+   CHATGPT_MANUAL_LOGIN=1
+   ```
 
 4. 再启动本服务；服务会附着到这个 Chrome，检测到聊天页即可用 `/api/chatgpt/chat`。
 
