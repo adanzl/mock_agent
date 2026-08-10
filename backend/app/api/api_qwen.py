@@ -1,13 +1,14 @@
 import logging
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
-from app.config import config
+from app.config import ROOT_DIR, config
 from app.services.chat_jobs.job_mgr import chat_job_mgr
 from app.services.qwen.qwen_mgr import qwen_mgr
 
 bp = Blueprint("qwen", __name__)
 logger = logging.getLogger(__name__)
+_DOC_PATH = ROOT_DIR / "docs" / "qwen-api.md"
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -39,6 +40,16 @@ def health():
             "service": "qwen",
             "enabled": bool(config.qwen_enabled),
         }
+    )
+
+
+@bp.get("/doc")
+def doc():
+    if not _DOC_PATH.is_file():
+        return jsonify({"ok": False, "error": f"doc not found: {_DOC_PATH.name}"}), 404
+    return Response(
+        _DOC_PATH.read_text(encoding="utf-8"),
+        mimetype="text/markdown; charset=utf-8",
     )
 
 

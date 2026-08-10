@@ -70,6 +70,7 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
 | --- | --- | --- |
 | GET | `/health` | 进程健康检查（根路径也有 `/health`） |
 | GET | `/api/qwen/health` | Qwen 模块健康检查 |
+| GET | `/api/qwen/doc` | 返回本文档 Markdown 原文 |
 | GET | `/api/qwen/status` | 登录态 / 浏览器状态 |
 | POST | `/api/qwen/chat` | 提问（同步，长内容易被网关超时掐断） |
 | POST | `/api/qwen/chat/async` | 异步提问（立即返回 `job_id`） |

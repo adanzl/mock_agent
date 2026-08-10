@@ -66,6 +66,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | --- | --- | --- |
 | GET | `/health` | 进程健康检查（根路径也有 `/health`） |
 | GET | `/api/deepseek/health` | DeepSeek 模块健康检查 |
+| GET | `/api/deepseek/doc` | 返回本文档 Markdown 原文 |
 | GET | `/api/deepseek/status` | 登录态 / 浏览器状态 |
 | POST | `/api/deepseek/chat` | 提问（同步，长内容易被网关超时掐断） |
 | POST | `/api/deepseek/chat/async` | 异步提问（立即返回 `job_id`） |
