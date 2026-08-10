@@ -44,3 +44,4 @@
 
 - DeepSeek 接口调用：`docs/deepseek-api.md`（接口变更时同步更新）
 - ChatGPT 接口调用：`docs/chatgpt-api.md`（接口变更时同步更新）
+- Qwen 接口调用：`docs/qwen-api.md`（接口变更时同步更新）

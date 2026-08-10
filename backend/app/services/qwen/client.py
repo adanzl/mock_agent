@@ -1,4 +1,4 @@
-"""Playwright client that drives chat.deepseek.com like a real user."""
+"""Playwright client that drives chat.qwen.ai like a real user."""
 
 from __future__ import annotations
 
@@ -17,12 +17,11 @@ from app.repositories.database import db_mgr
 
 logger = logging.getLogger(__name__)
 
-PROVIDER = "deepseek"
-CHAT_URL = "https://chat.deepseek.com/"
-CONVERSATION_ID_RE = re.compile(
-    r"/a/chat/s/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
-    re.IGNORECASE,
-)
+PROVIDER = "qwen"
+CHAT_URL = "https://chat.qwen.ai/"
+AUTH_URL = "https://chat.qwen.ai/auth"
+CONVERSATION_ID_RE = re.compile(r"/c/([^/?#]+)", re.IGNORECASE)
+RESERVED_CONV_IDS = {"new-chat", "guest", "new"}
 
 # Playwright sync API is thread-bound; each worker loop sets this.
 _tls = threading.local()
@@ -41,46 +40,75 @@ class _WorkerSlot:
     context: BrowserContext | None = None
     page: Page | None = None
     busy: bool = False
+    pending: int = 0
     last_status: dict[str, Any] | None = None
 
+
+# mode=auto keeps current model; other values try to match model selector text.
 MODE_ALIASES = {
-    "fast": "instant",
-    "instant": "instant",
-    "quick": "instant",
-    "快速": "instant",
-    "快速模式": "instant",
-    "expert": "expert",
-    "专家": "expert",
-    "专家模式": "expert",
+    "auto": "auto",
+    "default": "auto",
+    "plus": "Qwen3.5-Plus",
+    "qwen3.5-plus": "Qwen3.5-Plus",
+    "flash": "Qwen3.5-Flash",
+    "qwen3.5-flash": "Qwen3.5-Flash",
+    "max": "Qwen3-Max",
+    "qwen3-max": "Qwen3-Max",
+    "qwen3.6-plus": "Qwen3.6-Plus",
 }
 
 CHAT_READY_SELECTORS = [
-    "textarea[placeholder='Message DeepSeek']",
-    "textarea[placeholder*='DeepSeek']",
-    "textarea[placeholder*='发送']",
+    "textarea.message-input-textarea",
+    "textarea[placeholder*='Ask']",
+    "textarea[placeholder*='输入']",
+    "textarea[placeholder*='Message']",
     "textarea",
 ]
 SIGN_IN_SELECTORS = [
-    ".ds-sign-in-form__main",
-    ".ds-sign-in-form-wrapper",
-    ".ds-auth-form-wrapper",
-    ".ds-sign-up-form__main",
+    ".qwenchat-auth-pc-input-items",
+    "button.qwenchat-auth-pc-submit-button",
     "input[type='password']",
     "button:has-text('Log in')",
     "button:has-text('Sign in')",
     "button:has-text('登录')",
 ]
-ASSISTANT_SELECTOR = "div.ds-message:has(.ds-markdown)"
+ASSISTANT_SELECTORS = [
+    ".response-message-content.phase-answer",
+    ".qwen-chat-message-assistant .qwen-markdown",
+    ".qwen-chat-message-assistant",
+    ".chat-response-message",
+]
+SEND_SELECTORS = [
+    "div.chat-prompt-send-button button",
+    "button:has-text('发送')",
+    "button:has-text('Send')",
+    "[aria-label*='Send']",
+    "[aria-label*='发送']",
+]
+STOP_SELECTORS = [
+    "button.stop-button",
+    "button:has-text('停止')",
+    "button:has-text('Stop')",
+    "[aria-label*='Stop']",
+    "[aria-label*='停止']",
+    "div.chat-prompt-send-button button.stop-button",
+]
 NEW_CHAT_SELECTORS = [
+    "div.sidebar-entry-fixed-list-content:has-text('New Chat')",
+    "div.sidebar-entry-fixed-list-content:has-text('新对话')",
+    "div.sidebar-entry-fixed-list-content:has-text('新聊天')",
+    "button:has-text('New Chat')",
     "button:has-text('新对话')",
-    "button:has-text('New chat')",
-    "button[aria-label*='New']",
-    "button[aria-label*='新']",
-    "a[href='/']",
+    "a:has-text('New Chat')",
+    "a:has-text('新对话')",
+]
+DONE_HINT_SELECTORS = [
+    "button.copy-response-button",
+    ".copy-response-button",
 ]
 
 
-class DeepSeekClient:
+class QwenClient:
     """Browser pool: N Playwright workers run chats in parallel."""
 
     def __init__(
@@ -92,21 +120,18 @@ class DeepSeekClient:
     ) -> None:
         self.headless = config.headless if headless is None else headless
         self.timeout_ms = int(
-            config.deepseek_timeout_ms if timeout_ms is None else timeout_ms
+            config.qwen_timeout_ms if timeout_ms is None else timeout_ms
         )
-        # Prefer system Chrome (channel=chrome). Override with CHROME_PATH
-        # or BROWSER_CHANNEL=chromium for Playwright's bundled browser.
         self.browser_channel = config.browser_channel
         self.executable_path = config.chrome_path
-        self.username = config.deepseek_username
-        self.password = config.deepseek_password
-        self.auto_login = config.deepseek_auto_login
+        self.username = config.qwen_username
+        self.password = config.qwen_password
+        self.auto_login = config.qwen_auto_login
         self.worker_count = max(
             1,
-            min(4, int(config.deepseek_workers if workers is None else workers)),
+            min(4, int(config.qwen_workers if workers is None else workers)),
         )
 
-        # Each worker thread owns its Playwright stack (sync API is thread-bound).
         self._slots: list[_WorkerSlot] = [
             _WorkerSlot(worker_id=i) for i in range(self.worker_count)
         ]
@@ -120,17 +145,19 @@ class DeepSeekClient:
             thread = threading.Thread(
                 target=self._worker_loop,
                 args=(slot,),
-                name=f"deepseek-playwright-{slot.worker_id}",
+                name=f"qwen-playwright-{slot.worker_id}",
                 daemon=True,
             )
             thread.start()
             self._threads.append(thread)
-        logger.info("deepseek worker pool started workers=%s", self.worker_count)
+        logger.info("qwen worker pool started workers=%s", self.worker_count)
 
     def _worker_loop(self, slot: _WorkerSlot) -> None:
         while True:
             func, done = slot.tasks.get()
             if func is None:
+                with self._pick_lock:
+                    slot.pending = max(0, slot.pending - 1)
                 try:
                     _tls.slot = slot
                     self._stop_unlocked()
@@ -151,6 +178,8 @@ class DeepSeekClient:
             except BaseException as exc:  # noqa: BLE001
                 done.put((False, exc))
             finally:
+                with self._pick_lock:
+                    slot.pending = max(0, slot.pending - 1)
                 try:
                     self._refresh_slot_status(slot)
                     self._publish_status()
@@ -163,42 +192,62 @@ class DeepSeekClient:
     def _current_slot(self) -> _WorkerSlot:
         slot = getattr(_tls, "slot", None)
         if slot is None:
-            raise RuntimeError("deepseek browser call must run on a worker thread")
+            raise RuntimeError("qwen browser call must run on a worker thread")
         return slot
 
     def _pick_slot(self) -> _WorkerSlot:
         """Prefer an idle worker; otherwise the shortest queue."""
         with self._pick_lock:
-            idle = [s for s in self._slots if not s.busy]
-            pool = idle or list(self._slots)
-            return min(pool, key=lambda s: s.tasks.qsize())
+            return min(
+                self._slots,
+                key=lambda s: (s.busy, s.pending, s.worker_id),
+            )
 
     def _submit_to(self, slot: _WorkerSlot, func: Callable[[], Any]) -> Any:
         done: "queue.Queue[tuple]" = queue.Queue()
-        slot.tasks.put((func, done))
+        with self._pick_lock:
+            slot.pending += 1
+            slot.tasks.put((func, done))
         ok, result = done.get()
         if not ok:
             raise result
         return result
 
     def _submit(self, func: Callable[[], Any]) -> Any:
-        """Run func on one free (or least-loaded) Playwright worker."""
-        slot = self._pick_slot()
-        logger.debug(
-            "submit worker=%s busy=%s queued=%s",
-            slot.worker_id,
-            slot.busy,
-            slot.tasks.qsize(),
-        )
-        return self._submit_to(slot, func)
+        """Run func on one free (or least-loaded) Playwright worker.
+
+        Pick + enqueue under one lock so concurrent /chat calls fan out to
+        different workers instead of all landing on worker 0.
+        """
+        done: "queue.Queue[tuple]" = queue.Queue()
+        with self._pick_lock:
+            slot = min(
+                self._slots,
+                key=lambda s: (s.busy, s.pending, s.worker_id),
+            )
+            slot.pending += 1
+            slot.tasks.put((func, done))
+            logger.debug(
+                "submit worker=%s busy=%s pending=%s slots=%s",
+                slot.worker_id,
+                slot.busy,
+                slot.pending,
+                [(s.worker_id, s.busy, s.pending) for s in self._slots],
+            )
+        ok, result = done.get()
+        if not ok:
+            raise result
+        return result
 
     def _submit_all(self, func: Callable[[], Any]) -> list[Any]:
         """Run func once on every worker (start / ensure_ready / stop prep)."""
         dones: list["queue.Queue[tuple]"] = []
-        for slot in self._slots:
-            done: "queue.Queue[tuple]" = queue.Queue()
-            slot.tasks.put((func, done))
-            dones.append(done)
+        with self._pick_lock:
+            for slot in self._slots:
+                done: "queue.Queue[tuple]" = queue.Queue()
+                slot.pending += 1
+                slot.tasks.put((func, done))
+                dones.append(done)
         results: list[Any] = []
         errors: list[BaseException] = []
         for done in dones:
@@ -242,6 +291,7 @@ class DeepSeekClient:
             "state": state,
             "url": slot.page.url,
             "busy": slot.busy,
+            "logged_in": self._has_token_cookie_in(slot.context),
         }
 
     def _publish_status(self) -> None:
@@ -255,11 +305,11 @@ class DeepSeekClient:
             for slot in self._slots:
                 if slot.busy:
                     busy += 1
-                queued += slot.tasks.qsize()
+                queued += slot.pending
                 detail = dict(slot.last_status or {})
                 detail.setdefault("worker_id", slot.worker_id)
                 detail["busy"] = slot.busy
-                detail["queued"] = slot.tasks.qsize()
+                detail["queued"] = slot.pending
                 details.append(detail)
                 if detail.get("ready"):
                     ready_any = True
@@ -299,15 +349,14 @@ class DeepSeekClient:
         try:
             self._submit_all(self._stop_impl)
         except Exception:
-            logger.exception("deepseek worker pool stop failed")
+            logger.exception("qwen worker pool stop failed")
         self._publish_status()
-        logger.info("deepseek worker pool browsers closed workers=%s", self.worker_count)
+        logger.info("qwen worker pool browsers closed workers=%s", self.worker_count)
 
     def _stop_impl(self) -> None:
         self._stop_unlocked()
 
     def status(self) -> dict[str, Any]:
-        # Non-blocking: last aggregate snapshot from workers.
         self._publish_status()
         if self._last_status is not None:
             return dict(self._last_status)
@@ -334,20 +383,26 @@ class DeepSeekClient:
     def _ensure_ready_impl(self) -> dict[str, Any]:
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
-        if state == "auth":
+        # Guest chat also shows the textarea; when credentials are configured,
+        # require a real login cookie instead of treating guest as ready.
+        if self._needs_account_login() and not self._has_token_cookie():
+            ok = self._ensure_logged_in(page, force=True)
+            state = self._detect_shell_state(page)
+            if not ok or state != "chat" or not self._has_token_cookie():
+                raise RuntimeError(self._login_failed_message())
+        elif state == "auth":
             ok = self._ensure_logged_in(page)
             state = self._detect_shell_state(page)
             if not ok or state != "chat":
-                raise RuntimeError(
-                    "auto login failed; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise RuntimeError(self._login_failed_message())
         elif state != "chat":
             page.goto(CHAT_URL, wait_until="domcontentloaded")
             state = self._wait_shell_state(page, timeout_ms=60_000)
-            if state == "auth" and not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "auto login failed; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+            if self._needs_account_login() and not self._has_token_cookie():
+                if not self._ensure_logged_in(page, force=True):
+                    raise RuntimeError(self._login_failed_message())
+            elif state == "auth" and not self._ensure_logged_in(page):
+                raise RuntimeError(self._login_failed_message())
             state = self._detect_shell_state(page)
             if state != "chat":
                 raise RuntimeError(f"chat UI not ready, state={state}")
@@ -358,15 +413,19 @@ class DeepSeekClient:
             "state": state,
             "url": page.url,
             "session_saved": db_mgr.has_browser_session(PROVIDER),
+            "logged_in": self._has_token_cookie(),
             "worker_id": self._current_slot().worker_id,
         }
+
+    def _login_failed_message(self) -> str:
+        return "auto login failed; check QWEN_USERNAME/QWEN_PASSWORD in .env"
 
     def ask(
         self,
         question: str,
         *,
         conversation_id: str | None = None,
-        mode: str = "instant",
+        mode: str = "auto",
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
@@ -376,15 +435,10 @@ class DeepSeekClient:
             raise ValueError("question is empty")
 
         resolved_mode = self._normalize_mode(mode)
-        if resolved_mode == "expert" and search:
-            raise ValueError("expert mode does not support search; use mode=instant")
-
         timeout_s = self._resolve_chat_timeout_s(
             timeout_s,
-            mode=resolved_mode,
             deep_thinking=deep_thinking,
         )
-        # Validate on caller thread; browser work runs on a pool worker.
         return self._submit(
             lambda: self._ask_impl(
                 question=question,
@@ -400,14 +454,13 @@ class DeepSeekClient:
         self,
         timeout_s: int | None,
         *,
-        mode: str,
         deep_thinking: bool,
     ) -> int:
         if timeout_s is not None:
             return max(30, int(timeout_s))
-        if mode == "expert" or deep_thinking:
-            return max(30, config.deepseek_think_timeout_s)
-        return max(30, config.deepseek_chat_timeout_s)
+        if deep_thinking:
+            return max(30, config.qwen_think_timeout_s)
+        return max(30, config.qwen_chat_timeout_s)
 
     def _ask_impl(
         self,
@@ -434,10 +487,17 @@ class DeepSeekClient:
             len(question),
             timeout_s,
         )
-        if state == "auth":
+        if self._needs_account_login() and not self._has_token_cookie():
+            if not self._ensure_logged_in(page, force=True):
+                raise RuntimeError(
+                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env "
+                    f"(sqlite={db_mgr.path()})"
+                )
+            state = self._detect_shell_state(page)
+        elif state == "auth":
             if not self._ensure_logged_in(page):
                 raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env "
+                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env "
                     f"(sqlite={db_mgr.path()})"
                 )
             state = self._detect_shell_state(page)
@@ -445,9 +505,14 @@ class DeepSeekClient:
         if state != "chat":
             page.goto(CHAT_URL, wait_until="domcontentloaded")
             state = self._wait_shell_state(page, timeout_ms=60_000)
-            if state == "auth" and not self._ensure_logged_in(page):
+            if self._needs_account_login() and not self._has_token_cookie():
+                if not self._ensure_logged_in(page, force=True):
+                    raise RuntimeError(
+                        "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
+                    )
+            elif state == "auth" and not self._ensure_logged_in(page):
                 raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
+                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
                 )
             state = self._detect_shell_state(page)
             if state != "chat":
@@ -458,7 +523,6 @@ class DeepSeekClient:
         else:
             self._open_new_chat(page)
 
-        # Mode is fixed once a conversation exists; only switch on new chats.
         mode = self._apply_chat_options(
             page,
             mode=mode,
@@ -475,7 +539,7 @@ class DeepSeekClient:
 
         conv_id = self._conversation_id_from_url(page.url) or conversation_id
         if not conv_id:
-            raise RuntimeError("conversation_id missing after reply; DeepSeek URL has no chat id")
+            raise RuntimeError("conversation_id missing after reply; Qwen URL has no chat id")
 
         title = question.replace("\n", " ").strip()[:40] or None
         db_mgr.upsert_conversation(
@@ -513,13 +577,14 @@ class DeepSeekClient:
 
     @staticmethod
     def _normalize_mode(mode: str | None) -> str:
-        key = (mode or "instant").strip().lower()
-        # keep Chinese keys as-is for alias lookup before lowercasing broke them
-        raw = (mode or "instant").strip()
-        resolved = MODE_ALIASES.get(raw) or MODE_ALIASES.get(key)
-        if not resolved:
-            raise ValueError("mode must be instant/fast or expert")
-        return resolved
+        raw = (mode or "auto").strip()
+        key = raw.lower()
+        if key in MODE_ALIASES:
+            return MODE_ALIASES[key]
+        # Allow passing a concrete model label, e.g. "Qwen3.5-Plus".
+        if raw and raw.lower() != "auto":
+            return raw
+        return "auto"
 
     def _apply_chat_options(
         self,
@@ -530,124 +595,209 @@ class DeepSeekClient:
         search: bool,
         switch_mode: bool = True,
     ) -> str:
-        """Apply mode/toggles. Returns the mode actually in effect."""
-        if switch_mode:
-            actual_mode = self._select_mode(page, mode)
-        else:
-            actual_mode = self._detect_current_mode(page) or mode
-        self._set_feature_toggle(page, index=0, enabled=deep_thinking, label="deep_thinking")
-        if actual_mode == "instant":
-            self._set_feature_toggle(page, index=1, enabled=search, label="search")
-        elif search:
-            logger.warning("search ignored in expert mode")
+        actual_mode = mode
+        if switch_mode and mode and mode != "auto":
+            actual_mode = self._select_model(page, mode) or mode
+        self._set_thinking_mode(page, enabled=deep_thinking)
+        self._set_search_mode(page, enabled=search)
         return actual_mode
 
-    def _detect_current_mode(self, page: Page) -> str | None:
-        """Read selected mode from radios or conversation header badge."""
-        return page.evaluate(
-            """() => {
-                const radios = Array.from(document.querySelectorAll('[role="radio"]'));
-                for (const radio of radios) {
-                    if (radio.getAttribute('aria-checked') !== 'true') continue;
-                    const text = (radio.innerText || '').trim();
-                    if (/专家|Expert/i.test(text)) return 'expert';
-                    if (/快速|Instant/i.test(text)) return 'instant';
-                }
-                const header = document.querySelector('.the-header');
-                const text = header ? (header.innerText || '') : '';
-                if (/专家模式|Expert/i.test(text)) return 'expert';
-                if (/快速模式|Instant/i.test(text)) return 'instant';
-                return null;
-            }"""
+    def _select_model(self, page: Page, mode: str) -> str | None:
+        trigger = page.locator(
+            "[class*='model-selector-text'], "
+            "div[class*='model-selector'], "
+            "button:has-text('Qwen')"
         )
+        if trigger.count() == 0:
+            logger.warning("model selector not found; keep mode=%s", mode)
+            return None
+        try:
+            trigger.first.click(timeout=5_000)
+            time.sleep(0.4)
+        except Exception as exc:
+            logger.warning("open model selector failed: %s", exc)
+            return None
 
-    def _select_mode(self, page: Page, mode: str) -> str:
-        """Select chat mode on new-chat page (radios). Returns mode in effect."""
-        labels = (
-            ["快速模式", "快速", "Instant"]
-            if mode == "instant"
-            else ["专家模式", "专家", "Expert"]
+        popup = page.locator("div[class*='model-selector-popup'], [role='menu'], ul")
+        option = page.locator(
+            f"div[class*='model-selector-popup'] *:has-text('{mode}'), "
+            f"[role='menuitem']:has-text('{mode}'), "
+            f"li:has-text('{mode}'), "
+            f"div:has-text('{mode}')"
         )
-        for label in labels:
-            loc = page.locator(
-                f'[role="radiogroup"] [role="radio"]:has-text("{label}"), '
-                f'div[role="radio"]:has-text("{label}")'
-            )
-            if loc.count() == 0:
-                continue
-            target = loc.first
-            if target.get_attribute("aria-checked") != "true":
-                target.click()
-            logger.info("mode set to %s", mode)
+        try:
+            if option.count() > 0:
+                option.first.click(timeout=5_000)
+                logger.info("model set to %s", mode)
+                time.sleep(0.3)
+                return mode
+        except Exception as exc:
+            logger.warning("select model %s failed: %s", mode, exc)
+        finally:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            _ = popup
+        logger.warning("model option not found: %s", mode)
+        return None
+
+    def _set_thinking_mode(self, page: Page, *, enabled: bool) -> None:
+        """Qwen thinking control: Thinking / Fast (or 思考 / 快速)."""
+        wanted = ("Thinking", "思考", "深度思考") if enabled else ("Fast", "快速", "极速")
+        trigger = page.locator(
+            "span.ant-select-selection-item:has(div.qwen-select-thinking-label), "
+            "div.qwen-select-thinking-label, "
+            "span.qwen-select-thinking-label-text"
+        )
+        if trigger.count() == 0:
+            # Fallback text buttons.
+            for text in ("深度思考", "Thinking", "思考"):
+                loc = page.locator(
+                    f"button:has-text('{text}'), [role='button']:has-text('{text}')"
+                )
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                class_attr = (btn.get_attribute("class") or "").lower()
+                aria = (btn.get_attribute("aria-pressed") or "").lower()
+                active = (
+                    "active" in class_attr
+                    or "selected" in class_attr
+                    or aria == "true"
+                )
+                if active != enabled:
+                    try:
+                        btn.click(timeout=3_000)
+                        logger.info("thinking toggled via text=%s enabled=%s", text, enabled)
+                        time.sleep(0.2)
+                    except Exception:
+                        continue
+                return
+            if enabled:
+                logger.warning("thinking control not found")
+            return
+
+        try:
+            current = (
+                page.locator("span.qwen-select-thinking-label-text").first.inner_text(
+                    timeout=2_000
+                )
+                or ""
+            ).strip()
+        except Exception:
+            current = ""
+        if any(w.lower() in current.lower() for w in wanted):
+            logger.info("thinking already=%s current=%s", enabled, current)
+            return
+
+        try:
+            trigger.first.click(timeout=4_000)
             time.sleep(0.3)
-            return mode
-        return self._detect_current_mode(page) or mode
-
-    def _set_feature_toggle(
-        self,
-        page: Page,
-        *,
-        index: int,
-        enabled: bool,
-        label: str,
-    ) -> None:
-        result = page.evaluate(
-            """({ index, enabled }) => {
-                const toggles = Array.from(document.querySelectorAll('.ds-toggle-button'));
-                const btn = toggles[index];
-                if (!btn) return { ok: false };
-                const active = btn.classList.contains('ds-toggle-button--selected');
-                if (enabled !== active) btn.click();
-                return { ok: true, toggled: enabled !== active, active: enabled };
-            }""",
-            {"index": index, "enabled": enabled},
-        )
-        if result and result.get("ok"):
-            logger.info("%s set enabled=%s toggled=%s", label, enabled, result.get("toggled"))
-            time.sleep(0.2)
+        except Exception as exc:
+            logger.warning("open thinking dropdown failed: %s", exc)
             return
 
-        # text fallback for localized UI
-        texts = (
-            ["深度思考", "DeepThink", "Deep Think"]
-            if index == 0
-            else ["智能搜索", "Search", "联网搜索"]
-        )
-        for text in texts:
-            loc = page.locator(f'.ds-toggle-button:has-text("{text}"), [role="button"]:has-text("{text}")')
-            if loc.count() == 0:
+        clicked = False
+        for label in wanted:
+            opt = page.locator(
+                f"div.rc-virtual-list-holder-inner *:has-text('{label}'), "
+                f"div.qwen-select-thinking-label:has-text('{label}'), "
+                f"[role='option']:has-text('{label}'), "
+                f"li:has-text('{label}')"
+            )
+            if opt.count() == 0:
                 continue
-            btn = loc.first
-            class_attr = btn.get_attribute("class") or ""
-            active = "ds-toggle-button--selected" in class_attr
-            if active != enabled:
-                btn.click()
-                logger.info("%s toggled via text=%s enabled=%s", label, text, enabled)
-            else:
-                logger.info("%s already enabled=%s", label, enabled)
-            time.sleep(0.2)
+            try:
+                opt.first.click(timeout=3_000)
+                clicked = True
+                logger.info("thinking set to %s", label)
+                time.sleep(0.2)
+                break
+            except Exception:
+                continue
+        if not clicked and enabled:
+            logger.warning("thinking option not found wanted=%s", wanted)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    def _set_search_mode(self, page: Page, *, enabled: bool) -> None:
+        """Toggle web search via mode-select (best-effort)."""
+        container = page.locator("div.mode-select-current-mode")
+        currently_on = container.count() > 0 and container.first.is_visible()
+        if currently_on and not enabled:
+            close = page.locator("span.mode-select-current-mode-close")
+            if close.count() > 0:
+                try:
+                    close.first.click(timeout=3_000)
+                    logger.info("search disabled")
+                    time.sleep(0.2)
+                except Exception as exc:
+                    logger.warning("disable search failed: %s", exc)
             return
-        if enabled:
-            logger.warning("%s toggle not found", label)
+        if currently_on and enabled:
+            logger.info("search already enabled")
+            return
+        if not enabled:
+            return
+
+        trigger = page.locator(
+            "div.mode-select-open, div.mode-select, "
+            "button:has-text('搜索'), button:has-text('Search'), "
+            "[aria-label*='Search'], [aria-label*='搜索']"
+        )
+        if trigger.count() == 0:
+            logger.warning("search control not found")
+            return
+        try:
+            trigger.first.click(timeout=4_000)
+            time.sleep(0.3)
+        except Exception as exc:
+            logger.warning("open search menu failed: %s", exc)
+            return
+
+        option = page.locator(
+            "ul.ant-dropdown-menu-root.qwen-dropdown-menu li:has-text('搜索'), "
+            "ul.ant-dropdown-menu-root li:has-text('Search'), "
+            "ul.ant-dropdown-menu-root li:has-text('Web'), "
+            "li[data-menu-id]:has-text('搜索'), "
+            "li[data-menu-id]:has-text('Search')"
+        )
+        if option.count() == 0:
+            logger.warning("search menu item not found")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return
+        try:
+            option.first.click(timeout=3_000)
+            logger.info("search enabled")
+            time.sleep(0.2)
+        except Exception as exc:
+            logger.warning("enable search failed: %s", exc)
 
     def _conversation_id_from_url(self, url: str) -> str | None:
         match = CONVERSATION_ID_RE.search(url or "")
-        return match.group(1) if match else None
+        if not match:
+            return None
+        conv = match.group(1).strip()
+        if not conv or conv.lower() in RESERVED_CONV_IDS:
+            return None
+        return conv
 
     def _open_conversation(self, page: Page, conversation_id: str) -> None:
         conv = conversation_id.strip()
         match = CONVERSATION_ID_RE.search(conv)
         if match:
             conv = match.group(1)
-        elif not re.fullmatch(
-            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-            conv,
-            flags=re.IGNORECASE,
-        ):
+        if not conv or conv.lower() in RESERVED_CONV_IDS:
             raise ValueError(f"invalid conversation_id: {conversation_id}")
 
         record = db_mgr.get_conversation(conv)
-        target = (record or {}).get("url") or f"{CHAT_URL.rstrip('/')}/a/chat/s/{conv}"
+        target = (record or {}).get("url") or f"{CHAT_URL.rstrip('/')}/c/{conv}"
         if self._conversation_id_from_url(page.url) == conv:
             logger.info("already on conversation id=%s", conv)
             return
@@ -711,9 +861,10 @@ class DeepSeekClient:
             logger.error("browser launch failed: %s", detail)
             raise RuntimeError(
                 "failed to launch browser; install Chrome or set "
-                "CHROME_PATH to chrome.exe. "
+                "CHROME_PATH to chrome. "
                 f"Tried: {detail}"
             ) from exc
+
 
     def _start_unlocked(self) -> None:
         slot = self._current_slot()
@@ -736,8 +887,6 @@ class DeepSeekClient:
         slot.context = slot.browser.new_context(**context_kwargs)
         slot.page = slot.context.new_page()
         slot.page.set_default_timeout(self.timeout_ms)
-        # Make the browser look like a normal (non-automated) user so sites
-        # like chat.deepseek.com do not flag Playwright's headless fingerprint.
         slot.page.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -764,8 +913,6 @@ class DeepSeekClient:
             state,
             slot.page.url,
         )
-        # NOTE: login is left to callers (ensure_ready / ask) so it is not
-        # attempted twice per flow.
 
     def _stop_unlocked(self) -> None:
         slot = self._current_slot()
@@ -794,18 +941,40 @@ class DeepSeekClient:
         assert slot.page is not None
         return slot.page
 
-    def _ensure_logged_in(self, page: Page) -> bool:
-        """If on auth page, try password login from .env. Returns True when chat is ready."""
-        state = self._detect_shell_state(page)
-        if state == "chat":
-            return True
-        if state != "auth":
+    @staticmethod
+    def _has_token_cookie_in(context: BrowserContext | None) -> bool:
+        if context is None:
             return False
+        try:
+            cookies = context.cookies()
+        except Exception:
+            return False
+        for cookie in cookies:
+            name = str(cookie.get("name") or "")
+            value = str(cookie.get("value") or "")
+            domain = str(cookie.get("domain") or "")
+            if name == "token" and value and "qwen.ai" in domain:
+                return True
+        return False
+
+    def _has_token_cookie(self) -> bool:
+        return self._has_token_cookie_in(self._current_slot().context)
+
+    def _needs_account_login(self) -> bool:
+        return bool(self.auto_login and self.username and self.password)
+
+    def _ensure_logged_in(self, page: Page, *, force: bool = False) -> bool:
+        if self._has_token_cookie() and self._detect_shell_state(page) == "chat":
+            return True
+        state = self._detect_shell_state(page)
+        if state == "chat" and not force:
+            # Guest chat UI is usable without login cookie.
+            return True
         if not self.auto_login:
-            logger.warning("auth page but DEEPSEEK_AUTO_LOGIN disabled")
+            logger.warning("auth page but QWEN_AUTO_LOGIN disabled")
             return False
         if not self.username or not self.password:
-            logger.warning("auth page but DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD missing in .env")
+            logger.warning("auth page but QWEN_USERNAME/QWEN_PASSWORD missing in .env")
             return False
         try:
             self._password_login(page)
@@ -813,69 +982,66 @@ class DeepSeekClient:
             logger.exception("password login failed: %s", exc)
             return False
         state = self._wait_shell_state(page, timeout_ms=60_000)
-        if state == "chat":
+        if state == "chat" and self._has_token_cookie():
             self._save_storage_unlocked()
             logger.info("password login ok, storage saved")
             return True
-        logger.error("password login finished but state=%s", state)
+        logger.error(
+            "password login finished but state=%s token=%s",
+            state,
+            self._has_token_cookie(),
+        )
         return False
 
     def _password_login(self, page: Page) -> None:
         assert self.username and self.password
         logger.info("password login as %s", self.username)
-        if "sign_in" not in (page.url or "").lower():
-            page.goto("https://chat.deepseek.com/sign_in", wait_until="domcontentloaded")
+        if "/auth" not in (page.url or "").lower():
+            page.goto(AUTH_URL, wait_until="domcontentloaded")
         page.wait_for_load_state("domcontentloaded")
         time.sleep(0.8)
 
-        # Default UI is phone + SMS; switch to password login first.
-        # On the live page this control is a visible .ds-button labeled 密码登录.
-        switched = False
-        pw_mode = page.locator("div.ds-button:visible:has-text('密码登录')")
-        if pw_mode.count() == 0:
-            pw_mode = page.locator(
-                "div.ds-button:visible:has-text('Password'), "
-                "button:visible:has-text('密码登录')"
-            )
-        if pw_mode.count() > 0:
-            pw_mode.first.click(timeout=8_000)
-            switched = True
-            logger.info("switched to password login")
-        if not switched:
-            raise RuntimeError("password-login control not found on sign-in page")
-
-        page.wait_for_selector("input[type='password']", timeout=20_000)
-
-        account = page.locator(
-            "input[placeholder*='手机号/邮箱'], "
-            "input[placeholder*='手机号'], input[placeholder*='邮箱'], "
-            "input[placeholder*='Email'], input[placeholder*='Phone'], "
-            "input[type='email'], input[autocomplete='username'], input[type='tel']"
+        page.wait_for_selector(
+            ".qwenchat-auth-pc-input-items, input[type='password']",
+            timeout=30_000,
         )
-        if account.count() == 0:
-            account = page.locator("input[type='text']")
+
+        root = page.locator(".qwenchat-auth-pc-input-items")
+        if root.count() > 0:
+            account = root.first.locator("input:not([type='password'])")
+        else:
+            account = page.locator(
+                "input[type='email'], input[placeholder*='邮箱'], "
+                "input[placeholder*='Email'], input[autocomplete='username'], "
+                "input:not([type='password'])"
+            )
         if account.count() == 0:
             raise RuntimeError("login account input not found")
-
         account.first.fill(self.username, timeout=15_000)
         page.locator("input[type='password']").first.fill(self.password, timeout=15_000)
 
-        login_button = page.locator("div.ds-button--filled:visible:has-text('登录')")
-        if login_button.count() == 0:
-            login_button = page.locator(
-                "div.ds-button--filled:has-text('Log in'), "
-                "button:has-text('登录'), button:has-text('Log in')"
+        submit = page.locator("button.qwenchat-auth-pc-submit-button")
+        if submit.count() == 0:
+            submit = page.locator(
+                "button:has-text('登录'), button:has-text('Log in'), "
+                "button:has-text('Sign in'), button[type='submit']"
             )
-        if login_button.count() == 0:
+        if submit.count() == 0:
             raise RuntimeError("login button not found")
-        login_button.first.click(timeout=10_000)
+        submit.first.click(timeout=10_000)
 
-        deadline = time.time() + 45
+        deadline = time.time() + 90
         while time.time() < deadline:
-            if self._detect_shell_state(page) == "chat":
-                return
+            if self._has_token_cookie() or self._detect_shell_state(page) == "chat":
+                break
             time.sleep(0.5)
-        raise RuntimeError("login submit did not reach chat UI")
+        else:
+            raise RuntimeError("login submit did not set token cookie")
+
+        if self._detect_shell_state(page) != "chat":
+            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
+                raise RuntimeError("login submit did not reach chat UI")
 
     def _save_storage_unlocked(self) -> None:
         slot = self._current_slot()
@@ -898,13 +1064,10 @@ class DeepSeekClient:
         return False
 
     def _detect_shell_state(self, page: Page) -> str:
-        # Check chat first: after login the page may still keep a (hidden or
-        # off-screen) sign-in form in the DOM, so the presence of a visible
-        # chat textarea is the authoritative "logged in" signal.
         if self._has_visible(page, CHAT_READY_SELECTORS):
             return "chat"
         url = (page.url or "").lower()
-        if any(token in url for token in ("sign_in", "signin", "sign-in")):
+        if any(token in url for token in ("/auth", "sign_in", "signin", "login")):
             return "auth"
         if self._has_visible(page, SIGN_IN_SELECTORS):
             return "auth"
@@ -932,15 +1095,22 @@ class DeepSeekClient:
         box.fill(message)
 
     def _send_message(self, page: Page) -> None:
-        send = page.locator("div.ds-icon-button").last
-        try:
-            if send.count() > 0 and send.is_visible():
-                disabled = send.get_attribute("aria-disabled")
-                if disabled != "true":
-                    send.click()
-                    return
-        except Exception:
-            pass
+        for selector in SEND_SELECTORS:
+            loc = page.locator(selector)
+            try:
+                if loc.count() == 0 or not loc.first.is_visible():
+                    continue
+                disabled = loc.first.get_attribute("disabled")
+                aria = loc.first.get_attribute("aria-disabled")
+                if disabled is not None or aria == "true":
+                    continue
+                cls = (loc.first.get_attribute("class") or "").lower()
+                if "stop" in cls:
+                    continue
+                loc.first.click(timeout=5_000)
+                return
+            except Exception:
+                continue
         self._textarea(page).press("Enter")
 
     def _open_new_chat(self, page: Page) -> None:
@@ -953,36 +1123,45 @@ class DeepSeekClient:
                     return
             except Exception:
                 continue
-        page.goto(CHAT_URL, wait_until="domcontentloaded")
+        page.goto(f"{CHAT_URL.rstrip('/')}/c/new-chat", wait_until="domcontentloaded")
         self._wait_shell_state(page, timeout_ms=30_000)
+
+    def _assistant_locator(self, page: Page):
+        for selector in ASSISTANT_SELECTORS:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                return loc
+        return page.locator(ASSISTANT_SELECTORS[0])
 
     def _assistant_count(self, page: Page) -> int:
         try:
-            return page.locator(ASSISTANT_SELECTOR).count()
+            return self._assistant_locator(page).count()
         except Exception:
             return 0
 
     def _last_assistant_text(self, page: Page) -> str:
-        loc = page.locator(ASSISTANT_SELECTOR)
+        loc = self._assistant_locator(page)
         count = loc.count()
         if count <= 0:
             return ""
         try:
-            return (loc.nth(count - 1).inner_text() or "").strip()
+            text = (loc.nth(count - 1).inner_text() or "").strip()
+            # Strip thinking status chrome if it leaked into the node.
+            lines = [
+                line
+                for line in text.splitlines()
+                if not re.match(
+                    r"^(Thought completed|思考完成|Thinking|深度思考).*$",
+                    line.strip(),
+                    flags=re.IGNORECASE,
+                )
+            ]
+            return "\n".join(lines).strip()
         except Exception:
             return ""
 
     def _is_generating(self, page: Page) -> bool:
-        """True while DeepSeek is still producing a reply (stop control visible)."""
-        selectors = [
-            "button:has-text('停止')",
-            "div[role='button']:has-text('停止')",
-            "button:has-text('Stop')",
-            "div[role='button']:has-text('Stop')",
-            "[aria-label*='Stop']",
-            "[aria-label*='停止']",
-        ]
-        for selector in selectors:
+        for selector in STOP_SELECTORS:
             try:
                 loc = page.locator(selector)
                 count = min(loc.count(), 4)
@@ -993,12 +1172,14 @@ class DeepSeekClient:
                 continue
         return False
 
+    def _has_done_hint(self, page: Page) -> bool:
+        return self._has_visible(page, DONE_HINT_SELECTORS)
+
     def _wait_answer(self, page: Page, *, before_count: int, timeout_s: int) -> str:
         deadline = time.time() + timeout_s
         previous = ""
         stable = 0
         saw_new = False
-        # Longer quiet period for long replies / deep thinking streams.
         need_stable = 3
 
         while time.time() < deadline:
@@ -1014,7 +1195,8 @@ class DeepSeekClient:
             else:
                 stable = 0
             previous = text
-            if saw_new and text and not generating and stable >= need_stable:
+            done_hint = self._has_done_hint(page) if saw_new else False
+            if saw_new and text and not generating and (stable >= need_stable or done_hint):
                 return text
             time.sleep(1)
 
@@ -1030,13 +1212,13 @@ class DeepSeekClient:
         raise TimeoutError(f"no answer within {timeout_s}s")
 
 
-_client: DeepSeekClient | None = None
+_client: QwenClient | None = None
 _client_lock = threading.Lock()
 
 
-def get_client() -> DeepSeekClient:
+def get_client() -> QwenClient:
     global _client
     with _client_lock:
         if _client is None:
-            _client = DeepSeekClient()
+            _client = QwenClient()
         return _client

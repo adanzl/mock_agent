@@ -109,9 +109,12 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
   "mode": "instant",
   "deep_thinking": true,
   "search": false,
-  "url": "https://chat.deepseek.com/a/chat/s/uuid"
+  "url": "https://chat.deepseek.com/a/chat/s/uuid",
+  "worker_id": 0
 }
 ```
+
+说明：`worker_id` 表示处理该请求的浏览器 worker（`DEEPSEEK_WORKERS` 并行池中的编号）。多路 `/chat` 会分到不同空闲 worker，不再互相堵死；worker 都忙时仍会排队。
 
 ### 错误码
 
@@ -211,7 +214,7 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 
 `GET /api/deepseek/status`
 
-关注字段：`ready`（是否在聊天页）、`state`（`chat` / `auth` / `unknown`）、`session_saved`。
+关注字段：`ready`（是否在聊天页）、`state`（`chat` / `auth` / `unknown`）、`session_saved`；并行池还会返回 `workers` / `busy` / `idle` / `queued` / `workers_detail`。
 
 ---
 
@@ -266,4 +269,5 @@ print(r2["answer"])
 | `DEEPSEEK_TIMEOUT_MS` | Playwright 页面操作超时（登录/点击等），默认 120000 |
 | `DEEPSEEK_CHAT_TIMEOUT_S` | 普通聊天等待回复秒数，默认 300 |
 | `DEEPSEEK_THINK_TIMEOUT_S` | 专家模式或深度思考等待回复秒数，默认 600 |
+| `DEEPSEEK_WORKERS` | 并行浏览器 worker 数（1–4），默认 2；每个 worker 独立页面，多路 `/chat` 可同时进行 |
 | `LOG_DIR` | 日志目录，默认 `logs` |

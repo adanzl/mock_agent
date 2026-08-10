@@ -79,6 +79,10 @@ class Config:
         self.deepseek_think_timeout_s: int = int(
             os.getenv("DEEPSEEK_THINK_TIMEOUT_S", "600")
         )
+        # Parallel Playwright workers (each owns a browser page). Clamp 1..4.
+        self.deepseek_workers: int = max(
+            1, min(4, int(os.getenv("DEEPSEEK_WORKERS", "2")))
+        )
         self.deepseek_username: str | None = _opt("DEEPSEEK_USERNAME") or _opt(
             "DEEPSEEK_EMAIL"
         )
@@ -117,6 +121,20 @@ class Config:
         # Attach to a real Chrome via CDP (recommended for manual login).
         # Example: http://127.0.0.1:9222
         self.chatgpt_cdp_url: str | None = _opt("CHATGPT_CDP_URL")
+
+        # Qwen account / session (chat.qwen.ai)
+        # Master switch — off by default; set QWEN_ENABLED=1 to use.
+        self.qwen_enabled: bool = _bool("QWEN_ENABLED", False)
+        self.qwen_timeout_ms: int = int(os.getenv("QWEN_TIMEOUT_MS", "120000"))
+        self.qwen_chat_timeout_s: int = int(os.getenv("QWEN_CHAT_TIMEOUT_S", "300"))
+        self.qwen_think_timeout_s: int = int(os.getenv("QWEN_THINK_TIMEOUT_S", "600"))
+        # Parallel Playwright workers (each owns a browser page). Clamp 1..4.
+        self.qwen_workers: int = max(
+            1, min(4, int(os.getenv("QWEN_WORKERS", "2")))
+        )
+        self.qwen_username: str | None = _opt("QWEN_USERNAME") or _opt("QWEN_EMAIL")
+        self.qwen_password: str | None = _opt("QWEN_PASSWORD")
+        self.qwen_auto_login: bool = _bool("QWEN_AUTO_LOGIN", True)
 
 
 config = Config()

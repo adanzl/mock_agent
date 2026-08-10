@@ -14,6 +14,7 @@ from app import app_logger, create_app
 from app.config import config
 from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
 from app.services.deepseek.deepseek_mgr import deepseek_mgr
+from app.services.qwen.qwen_mgr import qwen_mgr
 
 log = app_logger
 app = create_app()
@@ -70,6 +71,31 @@ def _bootstrap_chatgpt() -> None:
         )
 
 
+def _bootstrap_qwen() -> None:
+    if not config.qwen_enabled:
+        log.info("qwen bootstrap skipped; QWEN_ENABLED=0")
+        return
+    if not _bool_env("BOOTSTRAP_QWEN", True):
+        log.info("qwen bootstrap skipped; BOOTSTRAP_QWEN=0")
+        return
+    if config.qwen_auto_login and (
+        not config.qwen_username or not config.qwen_password
+    ):
+        log.info("qwen bootstrap skipped; QWEN_USERNAME/PASSWORD not set")
+        return
+    try:
+        result = qwen_mgr.ensure_ready()
+        log.info(
+            "qwen ready state=%s session_saved=%s",
+            result.get("state"),
+            result.get("session_saved"),
+        )
+    except Exception:
+        log.exception(
+            "qwen auto login failed at startup; chat will retry on first request"
+        )
+
+
 def _bool_env(key: str, default: bool = True) -> bool:
     raw = os.getenv(key)
     if raw is None or not str(raw).strip():
@@ -92,6 +118,11 @@ threading.Thread(
     name="chatgpt-bootstrap",
     daemon=True,
 ).start()
+threading.Thread(
+    target=_bootstrap_qwen,
+    name="qwen-bootstrap",
+    daemon=True,
+).start()
 
 
 @atexit.register
@@ -102,6 +133,10 @@ def _shutdown_browser() -> None:
         pass
     try:
         chatgpt_mgr.stop()
+    except Exception:
+        pass
+    try:
+        qwen_mgr.stop()
     except Exception:
         pass
 
