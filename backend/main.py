@@ -86,10 +86,22 @@ def _bootstrap_qwen() -> None:
     try:
         result = qwen_mgr.ensure_ready()
         log.info(
-            "qwen ready state=%s session_saved=%s",
+            "qwen ready state=%s session_saved=%s workers=%s ready_workers=%s",
             result.get("state"),
             result.get("session_saved"),
+            result.get("workers"),
+            result.get("ready_workers"),
         )
+        detail = result.get("workers_detail") or []
+        for item in detail:
+            log.info(
+                "qwen worker ready worker_id=%s ready=%s state=%s logged_in=%s url=%s",
+                item.get("worker_id"),
+                item.get("ready"),
+                item.get("state"),
+                item.get("logged_in"),
+                item.get("url"),
+            )
     except Exception:
         log.exception(
             "qwen auto login failed at startup; chat will retry on first request"

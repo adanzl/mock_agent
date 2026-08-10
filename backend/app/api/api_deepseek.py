@@ -131,10 +131,11 @@ def chat():
         )
         answer = result.get("answer") or ""
         logger.info(
-            "chat ok answer_chars=%s mode=%s conv=%s answer=%s",
+            "chat ok answer_chars=%s mode=%s conv=%s worker=%s answer=%s",
             len(answer),
             result.get("mode"),
             result.get("conversation_id"),
+            result.get("worker_id"),
             answer,
         )
         return jsonify(result)

@@ -366,6 +366,17 @@ class QwenClient:
         """Start every worker browser and auto-login from .env if needed."""
         results = self._submit_all(self._ensure_ready_impl)
         self._publish_status()
+        for item in results:
+            if not item:
+                continue
+            logger.info(
+                "ensure_ready worker=%s ready=%s state=%s logged_in=%s url=%s",
+                item.get("worker_id"),
+                item.get("ready"),
+                item.get("state"),
+                item.get("logged_in"),
+                item.get("url"),
+            )
         merged = dict(results[0] if results else {"ok": True, "ready": False})
         merged["workers"] = self.worker_count
         merged["ready_workers"] = sum(1 for r in results if r and r.get("ready"))
@@ -477,7 +488,7 @@ class QwenClient:
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
         logger.info(
-            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s chars=%s timeout_s=%s",
+            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s chars=%s timeout_s=%s question=%s",
             slot.worker_id,
             state,
             conversation_id,
@@ -486,6 +497,7 @@ class QwenClient:
             search,
             len(question),
             timeout_s,
+            question,
         )
         if self._needs_account_login() and not self._has_token_cookie():
             if not self._ensure_logged_in(page, force=True):
@@ -557,11 +569,12 @@ class QwenClient:
         )
 
         logger.info(
-            "ask done worker=%s answer_chars=%s conv=%s elapsed=%.1fs",
+            "ask done worker=%s answer_chars=%s conv=%s elapsed=%.1fs answer=%s",
             slot.worker_id,
             len(answer),
             conv_id,
             time.perf_counter() - t0,
+            answer,
         )
         return {
             "ok": True,
@@ -984,18 +997,26 @@ class QwenClient:
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state == "chat" and self._has_token_cookie():
             self._save_storage_unlocked()
-            logger.info("password login ok, storage saved")
+            logger.info(
+                "password login ok worker=%s storage saved",
+                self._current_slot().worker_id,
+            )
             return True
         logger.error(
-            "password login finished but state=%s token=%s",
+            "password login finished but state=%s token=%s worker=%s",
             state,
             self._has_token_cookie(),
+            self._current_slot().worker_id,
         )
         return False
 
     def _password_login(self, page: Page) -> None:
         assert self.username and self.password
-        logger.info("password login as %s", self.username)
+        logger.info(
+            "password login as %s worker=%s",
+            self.username,
+            self._current_slot().worker_id,
+        )
         if "/auth" not in (page.url or "").lower():
             page.goto(AUTH_URL, wait_until="domcontentloaded")
         page.wait_for_load_state("domcontentloaded")
