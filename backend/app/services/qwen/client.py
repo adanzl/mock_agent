@@ -450,16 +450,35 @@ class QwenClient:
             timeout_s,
             deep_thinking=deep_thinking,
         )
-        return self._submit(
-            lambda: self._ask_impl(
-                question=question,
-                conversation_id=conversation_id,
-                mode=resolved_mode,
-                deep_thinking=deep_thinking,
-                search=search,
-                timeout_s=timeout_s,
-            )
-        )
+        attempts = 2
+        last_exc: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._submit(
+                    lambda: self._ask_impl(
+                        question=question,
+                        conversation_id=conversation_id,
+                        mode=resolved_mode,
+                        deep_thinking=deep_thinking,
+                        search=search,
+                        timeout_s=timeout_s,
+                    )
+                )
+            except TimeoutError as exc:
+                last_exc = exc
+                will_retry = attempt < attempts
+                logger.warning(
+                    "ask incomplete attempt=%s/%s will_retry=%s conv=%s error=%s",
+                    attempt,
+                    attempts,
+                    will_retry,
+                    conversation_id,
+                    exc,
+                )
+                if not will_retry:
+                    raise
+        assert last_exc is not None
+        raise last_exc
 
     def _resolve_chat_timeout_s(
         self,
@@ -1207,7 +1226,9 @@ class QwenClient:
             count = self._assistant_count(page)
             if count > before_count:
                 saw_new = True
-            text = self._last_assistant_text(page) if saw_new or count > 0 else ""
+            # Only read assistant text after a new bubble appears; otherwise stale
+            # text from the previous chat can be returned as a false success.
+            text = self._last_assistant_text(page) if saw_new else ""
             generating = self._is_generating(page)
             if generating:
                 stable = 0
@@ -1221,16 +1242,26 @@ class QwenClient:
                 return text
             time.sleep(1)
 
-        if previous:
+        generating = self._is_generating(page)
+        if saw_new and previous and not generating:
             logger.warning(
                 "answer wait ended with partial text chars=%s timeout_s=%s generating=%s",
                 len(previous),
                 timeout_s,
-                self._is_generating(page),
+                generating,
             )
             return previous
-        logger.error("no answer within %ss", timeout_s)
-        raise TimeoutError(f"no answer within {timeout_s}s")
+        logger.error(
+            "no complete answer within %ss saw_new=%s chars=%s generating=%s",
+            timeout_s,
+            saw_new,
+            len(previous),
+            generating,
+        )
+        raise TimeoutError(
+            f"no complete answer within {timeout_s}s "
+            f"(saw_new={saw_new}, generating={generating})"
+        )
 
 
 _client: QwenClient | None = None
