@@ -53,12 +53,6 @@ def create_app() -> Flask:
     def health():
         return {"status": "ok"}
 
-    log.info(
-        "mock_agent app created env=%s log_dir=%s sqlite=%s",
-        config.env,
-        config.log_dir,
-        config.sqlite_path,
-    )
     return app
 
 

@@ -714,7 +714,7 @@ class ChatGPTClient:
         self._page.goto(CHAT_URL, wait_until="domcontentloaded")
         self._wait_human_challenge(self._page)
         state = self._wait_shell_state(self._page, timeout_ms=60_000)
-        logger.info(
+        logger.debug(
             "chat page ready state=%s url=%s cdp=%s",
             state,
             self._page.url,

@@ -96,7 +96,6 @@ def setup_server_logging(
 
     app_logger.addHandler(console)
     app_logger.addHandler(file_handler)
-    app_logger.info("Server log: %s (rotating daily)", log_dir / "app.log")
 
     access_logger.setLevel(logging.INFO)
     access_logger.propagate = False

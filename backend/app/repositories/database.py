@@ -105,7 +105,7 @@ class DbMgr:
                 conn.executescript(_SCHEMA)
                 conn.commit()
             self._initialized = True
-            logger.info("sqlite ready path=%s", path)
+            logger.debug("sqlite ready path=%s", path)
             return path
 
     def get_browser_session(self, provider: str) -> dict[str, Any] | None:
@@ -139,7 +139,7 @@ class DbMgr:
                 (provider, payload),
             )
             conn.commit()
-        logger.info("browser_session saved provider=%s bytes=%s", provider, len(payload))
+        logger.debug("browser_session saved provider=%s bytes=%s", provider, len(payload))
 
     def has_browser_session(self, provider: str) -> bool:
         return self.get_browser_session(provider) is not None

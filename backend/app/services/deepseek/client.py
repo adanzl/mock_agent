@@ -125,7 +125,7 @@ class DeepSeekClient:
             )
             thread.start()
             self._threads.append(thread)
-        logger.info("deepseek worker pool started workers=%s", self.worker_count)
+        logger.info("deepseek: pool workers=%s", self.worker_count)
 
     def _worker_loop(self, slot: _WorkerSlot) -> None:
         while True:
@@ -286,7 +286,7 @@ class DeepSeekClient:
         self._submit_all(self._start_impl)
 
     def _start_impl(self) -> None:
-        logger.info(
+        logger.debug(
             "browser start requested worker=%s headless=%s channel=%s",
             self._current_slot().worker_id,
             self.headless,
@@ -352,6 +352,7 @@ class DeepSeekClient:
             if state != "chat":
                 raise RuntimeError(f"chat UI not ready, state={state}")
         self._save_storage_unlocked()
+        self._refresh_slot_status(self._current_slot())
         return {
             "ok": True,
             "ready": True,
@@ -702,7 +703,7 @@ class DeepSeekClient:
                     **common,
                 )
                 self._browser_info = f"executable:{self.executable_path}"
-                logger.info("browser launched via executable_path=%s", self.executable_path)
+                logger.debug("browser launched via executable_path=%s", self.executable_path)
                 return browser
             except Exception as exc:
                 errors.append(f"executable_path={self.executable_path}: {exc}")
@@ -713,7 +714,7 @@ class DeepSeekClient:
             try:
                 browser = playwright.chromium.launch(channel=channel, **common)
                 self._browser_info = f"channel:{channel}"
-                logger.info("browser launched via channel=%s headless=%s", channel, self.headless)
+                logger.debug("browser launched via channel=%s headless=%s", channel, self.headless)
                 return browser
             except Exception as exc:
                 errors.append(f"channel={channel}: {exc}")
@@ -722,7 +723,7 @@ class DeepSeekClient:
         try:
             browser = playwright.chromium.launch(**common)
             self._browser_info = "bundled:chromium"
-            logger.info("browser launched via bundled chromium headless=%s", self.headless)
+            logger.debug("browser launched via bundled chromium headless=%s", self.headless)
             return browser
         except Exception as exc:
             errors.append(f"bundled chromium: {exc}")
@@ -747,7 +748,7 @@ class DeepSeekClient:
         stored = db_mgr.get_browser_session(PROVIDER)
         if stored:
             context_kwargs["storage_state"] = stored
-            logger.info(
+            logger.debug(
                 "load storage_state from sqlite provider=%s worker=%s",
                 PROVIDER,
                 slot.worker_id,
@@ -777,7 +778,7 @@ class DeepSeekClient:
         )
         slot.page.goto(CHAT_URL, wait_until="domcontentloaded")
         state = self._wait_shell_state(slot.page, timeout_ms=60_000)
-        logger.info(
+        logger.debug(
             "chat page ready worker=%s state=%s url=%s",
             slot.worker_id,
             state,

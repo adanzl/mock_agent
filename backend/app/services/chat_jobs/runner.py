@@ -54,7 +54,7 @@ class ChatJobRunner:
             daemon=True,
         )
         self._thread.start()
-        logger.info("chat job runner started")
+        logger.info("jobs: runner started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -63,7 +63,7 @@ class ChatJobRunner:
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
         self._thread = None
-        logger.info("chat job runner stopped")
+        logger.info("jobs: runner stopped")
 
     def kick(self) -> None:
         self._wake.set()
