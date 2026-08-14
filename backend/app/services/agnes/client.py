@@ -835,22 +835,27 @@ class AgnesClient:
         page: Page,
         url: str,
         *,
-        wait_until: str = "domcontentloaded",
+        wait_until: str = "commit",
         attempts: int = 3,
         timeout_ms: int | None = None,
     ) -> None:
-        """Navigate with retries when the SPA hangs before domcontentloaded.
+        """Navigate without waiting for a full domcontentloaded.
 
-        Agnes under headless sometimes never reaches a clean domcontentloaded
-        within the full UI timeout; use a short soft wait, then fall back to
-        commit so callers can proceed to shell/login checks.
+        Agnes is a heavy SPA: under headless, domcontentloaded often hangs for
+        the full UI timeout even though the document has already committed.
+        Use commit (+ short best-effort settle), and retry only if that fails.
         """
+        del wait_until  # Agnes always uses commit; keep kw for call-site compat.
         timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
         soft_timeout = min(30_000, max(5_000, timeout))
         last_exc: Exception | None = None
         for attempt in range(1, max(1, attempts) + 1):
             try:
-                page.goto(url, wait_until=wait_until, timeout=soft_timeout)
+                page.goto(url, wait_until="commit", timeout=soft_timeout)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                except Exception:
+                    pass
                 return
             except Exception as exc:
                 last_exc = exc
@@ -861,14 +866,9 @@ class AgnesClient:
                     url,
                     exc,
                 )
-                try:
-                    page.goto(url, wait_until="commit", timeout=soft_timeout)
-                    return
-                except Exception as exc2:
-                    last_exc = exc2
-                    if attempt >= attempts:
-                        break
-                    time.sleep(1.0)
+                if attempt >= attempts:
+                    break
+                time.sleep(1.0)
         assert last_exc is not None
         raise last_exc
 
@@ -1006,7 +1006,10 @@ class AgnesClient:
         )
         if "/login" not in (page.url or "").lower():
             self._goto(page, AUTH_URL)
-        page.wait_for_load_state("domcontentloaded")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except Exception:
+            pass
         time.sleep(0.8)
 
         # Prefer email tab when phone/other tabs are present.
