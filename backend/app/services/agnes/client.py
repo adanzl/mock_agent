@@ -839,12 +839,18 @@ class AgnesClient:
         attempts: int = 3,
         timeout_ms: int | None = None,
     ) -> None:
-        """Navigate with retries when the SPA hangs before domcontentloaded."""
+        """Navigate with retries when the SPA hangs before domcontentloaded.
+
+        Agnes under headless sometimes never reaches a clean domcontentloaded
+        within the full UI timeout; use a short soft wait, then fall back to
+        commit so callers can proceed to shell/login checks.
+        """
         timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        soft_timeout = min(30_000, max(5_000, timeout))
         last_exc: Exception | None = None
         for attempt in range(1, max(1, attempts) + 1):
             try:
-                page.goto(url, wait_until=wait_until, timeout=timeout)
+                page.goto(url, wait_until=wait_until, timeout=soft_timeout)
                 return
             except Exception as exc:
                 last_exc = exc
@@ -855,15 +861,13 @@ class AgnesClient:
                     url,
                     exc,
                 )
-                if attempt >= attempts:
-                    break
-                # commit is enough to escape a hung domcontentloaded wait;
-                # shell wait below (callers) still confirms chat UI.
                 try:
-                    page.goto(url, wait_until="commit", timeout=min(30_000, timeout))
+                    page.goto(url, wait_until="commit", timeout=soft_timeout)
                     return
                 except Exception as exc2:
                     last_exc = exc2
+                    if attempt >= attempts:
+                        break
                     time.sleep(1.0)
         assert last_exc is not None
         raise last_exc

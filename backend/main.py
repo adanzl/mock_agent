@@ -137,6 +137,7 @@ def _bootstrap_agnes() -> None:
     ):
         log.info("agnes: skipped (USERNAME/PASSWORD not set)")
         return
+    log.info("agnes: warming up...")
     attempts = 3
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
