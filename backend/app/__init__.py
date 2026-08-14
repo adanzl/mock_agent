@@ -18,6 +18,7 @@ log = app_logger
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    from app.api.api_agnes import bp as agnes_bp
     from app.api.api_chatgpt import bp as chatgpt_bp
     from app.api.api_deepseek import bp as deepseek_bp
     from app.api.api_qwen import bp as qwen_bp
@@ -27,6 +28,7 @@ def create_app() -> Flask:
     app.register_blueprint(deepseek_bp, url_prefix="/api/deepseek")
     app.register_blueprint(chatgpt_bp, url_prefix="/api/chatgpt")
     app.register_blueprint(qwen_bp, url_prefix="/api/qwen")
+    app.register_blueprint(agnes_bp, url_prefix="/api/agnes")
 
     @app.before_request
     def _record_request_start_time():

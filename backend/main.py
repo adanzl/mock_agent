@@ -12,6 +12,7 @@ os.chdir(BACKEND_DIR)
 
 from app import app_logger, create_app
 from app.config import config
+from app.services.agnes.agnes_mgr import agnes_mgr
 from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
 from app.services.chat_jobs.runner import chat_job_runner
 from app.services.deepseek.deepseek_mgr import deepseek_mgr
@@ -124,6 +125,35 @@ def _bootstrap_qwen() -> None:
         )
 
 
+def _bootstrap_agnes() -> None:
+    if not config.agnes_enabled:
+        log.info("agnes: skipped (disabled)")
+        return
+    if not _bool_env("BOOTSTRAP_AGNES", True):
+        log.info("agnes: skipped (BOOTSTRAP_AGNES=0)")
+        return
+    if config.agnes_auto_login and (
+        not config.agnes_username or not config.agnes_password
+    ):
+        log.info("agnes: skipped (USERNAME/PASSWORD not set)")
+        return
+    try:
+        result = agnes_mgr.ensure_ready()
+        workers = result.get("workers")
+        ready_workers = result.get("ready_workers")
+        log.info(
+            "agnes: ready state=%s workers=%s/%s session_saved=%s",
+            result.get("state"),
+            ready_workers if ready_workers is not None else "?",
+            workers if workers is not None else "?",
+            result.get("session_saved"),
+        )
+    except Exception:
+        log.exception(
+            "agnes: startup login failed; chat will retry on first request"
+        )
+
+
 # Warm up browser sessions in background threads so the web server starts
 # immediately even if auto-login is slow or fails. Login is retried lazily
 # on the first chat request either way.
@@ -133,6 +163,7 @@ _bootstrap_targets = (
     ("deepseek-bootstrap", _bootstrap_deepseek),
     ("chatgpt-bootstrap", _bootstrap_chatgpt),
     ("qwen-bootstrap", _bootstrap_qwen),
+    ("agnes-bootstrap", _bootstrap_agnes),
 )
 _bootstrap_pending = len(_bootstrap_targets)
 _bootstrap_lock = threading.Lock()
@@ -175,6 +206,10 @@ def _shutdown_browser() -> None:
         pass
     try:
         qwen_mgr.stop()
+    except Exception:
+        pass
+    try:
+        agnes_mgr.stop()
     except Exception:
         pass
 
