@@ -137,21 +137,33 @@ def _bootstrap_agnes() -> None:
     ):
         log.info("agnes: skipped (USERNAME/PASSWORD not set)")
         return
-    try:
-        result = agnes_mgr.ensure_ready()
-        workers = result.get("workers")
-        ready_workers = result.get("ready_workers")
-        log.info(
-            "agnes: ready state=%s workers=%s/%s session_saved=%s",
-            result.get("state"),
-            ready_workers if ready_workers is not None else "?",
-            workers if workers is not None else "?",
-            result.get("session_saved"),
-        )
-    except Exception:
-        log.exception(
-            "agnes: startup login failed; chat will retry on first request"
-        )
+    attempts = 3
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = agnes_mgr.ensure_ready()
+            workers = result.get("workers")
+            ready_workers = result.get("ready_workers")
+            log.info(
+                "agnes: ready state=%s workers=%s/%s session_saved=%s",
+                result.get("state"),
+                ready_workers if ready_workers is not None else "?",
+                workers if workers is not None else "?",
+                result.get("session_saved"),
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "agnes: startup login attempt=%s/%s failed: %s",
+                attempt,
+                attempts,
+                exc,
+            )
+    log.warning(
+        "agnes: startup login failed; chat will retry on first request: %s",
+        last_error,
+    )
 
 
 # Warm up browser sessions in background threads so the web server starts

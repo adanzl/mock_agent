@@ -410,7 +410,7 @@ class AgnesClient:
             if not ok or state != "chat":
                 raise RuntimeError(self._login_failed_message())
         elif state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -538,7 +538,7 @@ class AgnesClient:
             state = self._detect_shell_state(page)
 
         if state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -719,7 +719,7 @@ class AgnesClient:
             logger.info("already on conversation id=%s", conv)
             return
         logger.info("open conversation id=%s url=%s", conv, target)
-        page.goto(str(target), wait_until="domcontentloaded")
+        self._goto(page, str(target))
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state != "chat":
             raise RuntimeError(f"failed to open conversation {conv}, state={state}")
@@ -821,7 +821,7 @@ class AgnesClient:
                     : originalQuery(parameters);
             """
         )
-        slot.page.goto(CHAT_URL, wait_until="domcontentloaded")
+        self._goto(slot.page, CHAT_URL)
         state = self._wait_shell_state(slot.page, timeout_ms=60_000)
         logger.debug(
             "chat page ready worker=%s state=%s url=%s",
@@ -829,6 +829,44 @@ class AgnesClient:
             state,
             slot.page.url,
         )
+
+    def _goto(
+        self,
+        page: Page,
+        url: str,
+        *,
+        wait_until: str = "domcontentloaded",
+        attempts: int = 3,
+        timeout_ms: int | None = None,
+    ) -> None:
+        """Navigate with retries when the SPA hangs before domcontentloaded."""
+        timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                page.goto(url, wait_until=wait_until, timeout=timeout)
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "goto stuck attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    attempts,
+                    url,
+                    exc,
+                )
+                if attempt >= attempts:
+                    break
+                # commit is enough to escape a hung domcontentloaded wait;
+                # shell wait below (callers) still confirms chat UI.
+                try:
+                    page.goto(url, wait_until="commit", timeout=min(30_000, timeout))
+                    return
+                except Exception as exc2:
+                    last_exc = exc2
+                    time.sleep(1.0)
+        assert last_exc is not None
+        raise last_exc
 
     def _stop_unlocked(self) -> None:
         slot = self._current_slot()
@@ -963,7 +1001,7 @@ class AgnesClient:
             self._current_slot().worker_id,
         )
         if "/login" not in (page.url or "").lower():
-            page.goto(AUTH_URL, wait_until="domcontentloaded")
+            self._goto(page, AUTH_URL)
         page.wait_for_load_state("domcontentloaded")
         time.sleep(0.8)
 
@@ -1022,7 +1060,7 @@ class AgnesClient:
             raise RuntimeError("login submit did not leave login / set auth")
 
         if self._detect_shell_state(page) != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
                 raise RuntimeError("login submit did not reach chat UI")
 
@@ -1142,7 +1180,7 @@ class AgnesClient:
                     return
             except Exception:
                 continue
-        page.goto(CHAT_URL, wait_until="domcontentloaded")
+        self._goto(page, CHAT_URL)
         self._wait_shell_state(page, timeout_ms=30_000)
 
     def _assistant_locator(self, page: Page):
