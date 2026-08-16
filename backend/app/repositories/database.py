@@ -107,7 +107,7 @@ class DbMgr:
                 self._ensure_chat_job_images_column(conn)
                 conn.commit()
             self._initialized = True
-            logger.info("sqlite ready path=%s", path)
+            logger.debug("sqlite ready path=%s", path)
             return path
 
     @staticmethod
@@ -151,7 +151,7 @@ class DbMgr:
                 (provider, payload),
             )
             conn.commit()
-        logger.info("browser_session saved provider=%s bytes=%s", provider, len(payload))
+        logger.debug("browser_session saved provider=%s bytes=%s", provider, len(payload))
 
     def has_browser_session(self, provider: str) -> bool:
         return self.get_browser_session(provider) is not None

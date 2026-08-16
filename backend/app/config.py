@@ -136,5 +136,19 @@ class Config:
         self.qwen_password: str | None = _opt("QWEN_PASSWORD")
         self.qwen_auto_login: bool = _bool("QWEN_AUTO_LOGIN", True)
 
+        # Agnes account / session (app.agnes-ai.com)
+        # Master switch — off by default; set AGNES_ENABLED=1 to use.
+        self.agnes_enabled: bool = _bool("AGNES_ENABLED", False)
+        self.agnes_timeout_ms: int = int(os.getenv("AGNES_TIMEOUT_MS", "120000"))
+        self.agnes_chat_timeout_s: int = int(os.getenv("AGNES_CHAT_TIMEOUT_S", "300"))
+        self.agnes_think_timeout_s: int = int(os.getenv("AGNES_THINK_TIMEOUT_S", "600"))
+        # Parallel Playwright workers (each owns a browser page). Clamp 1..4.
+        self.agnes_workers: int = max(
+            1, min(4, int(os.getenv("AGNES_WORKERS", "2")))
+        )
+        self.agnes_username: str | None = _opt("AGNES_USERNAME") or _opt("AGNES_EMAIL")
+        self.agnes_password: str | None = _opt("AGNES_PASSWORD")
+        self.agnes_auto_login: bool = _bool("AGNES_AUTO_LOGIN", True)
+
 
 config = Config()

@@ -29,6 +29,7 @@ class ChatJobRunner:
     def _resolve_askers(self) -> dict[str, AskFn]:
         if self._askers is not None:
             return self._askers
+        from app.services.agnes.agnes_mgr import agnes_mgr
         from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
         from app.services.deepseek.deepseek_mgr import deepseek_mgr
         from app.services.qwen.qwen_mgr import qwen_mgr
@@ -37,6 +38,7 @@ class ChatJobRunner:
             "deepseek": deepseek_mgr.ask,
             "chatgpt": chatgpt_mgr.ask,
             "qwen": qwen_mgr.ask,
+            "agnes": agnes_mgr.ask,
         }
         return self._askers
 
@@ -54,7 +56,7 @@ class ChatJobRunner:
             daemon=True,
         )
         self._thread.start()
-        logger.info("chat job runner started")
+        logger.info("jobs: runner started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -63,7 +65,7 @@ class ChatJobRunner:
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
         self._thread = None
-        logger.info("chat job runner stopped")
+        logger.info("jobs: runner stopped")
 
     def kick(self) -> None:
         self._wake.set()

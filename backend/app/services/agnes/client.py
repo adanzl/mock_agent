@@ -1,22 +1,15 @@
-"""Playwright client that drives chat.qwen.ai like a real user."""
+"""Playwright client that drives app.agnes-ai.com like a real user."""
 
 from __future__ import annotations
 
-import base64
 import logging
-import mimetypes
 import queue
 import re
-import shutil
-import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
@@ -25,17 +18,18 @@ from app.repositories.database import db_mgr
 
 logger = logging.getLogger(__name__)
 
-PROVIDER = "qwen"
-CHAT_URL = "https://chat.qwen.ai/"
-AUTH_URL = "https://chat.qwen.ai/auth"
-CONVERSATION_ID_RE = re.compile(r"/c/([^/?#]+)", re.IGNORECASE)
-RESERVED_CONV_IDS = {"new-chat", "guest", "new"}
-MAX_IMAGES = 4
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
-DATA_URL_RE = re.compile(
-    r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$",
-    re.IGNORECASE | re.DOTALL,
+PROVIDER = "agnes"
+CHAT_URL = "https://app.agnes-ai.com/"
+AUTH_URL = "https://app.agnes-ai.com/login"
+# Real Agnes chats use ?conversationId=<digits> (not /c/<id>).
+CONVERSATION_ID_PATTERNS = (
+    re.compile(r"[?&]conversationId=([^&#]+)", re.IGNORECASE),
+    re.compile(r"/chat/([^/?#]+)", re.IGNORECASE),
+    re.compile(r"/c/([^/?#]+)", re.IGNORECASE),
+    re.compile(r"/conversation/([^/?#]+)", re.IGNORECASE),
+    re.compile(r"/agent/([^/?#]+)", re.IGNORECASE),
 )
+RESERVED_CONV_IDS = {"new-chat", "guest", "new", "login"}
 
 # Playwright sync API is thread-bound; each worker loop sets this.
 _tls = threading.local()
@@ -58,96 +52,77 @@ class _WorkerSlot:
     last_status: dict[str, Any] | None = None
 
 
-# mode=auto keeps current model; other values try to match model selector text.
+# mode=auto keeps current model; other values accepted but UI switch is no-op.
 MODE_ALIASES = {
     "auto": "auto",
     "default": "auto",
-    "plus": "Qwen3.5-Plus",
-    "qwen3.5-plus": "Qwen3.5-Plus",
-    "flash": "Qwen3.5-Flash",
-    "qwen3.5-flash": "Qwen3.5-Flash",
-    "max": "Qwen3-Max",
-    "qwen3-max": "Qwen3-Max",
-    "qwen3.6-plus": "Qwen3.6-Plus",
 }
 
 CHAT_READY_SELECTORS = [
-    "textarea.message-input-textarea",
-    "textarea[placeholder*='Ask']",
-    "textarea[placeholder*='输入']",
-    "textarea[placeholder*='Message']",
+    "div[contenteditable='true'][role='textbox']",
+    "div[contenteditable='true'].min-h-\\[48px\\]",
+    "[role='textbox'][contenteditable='true']",
+    "textarea[placeholder*='分配一个任务']",
+    "textarea[placeholder*='任务']",
     "textarea",
 ]
 SIGN_IN_SELECTORS = [
-    ".qwenchat-auth-pc-input-items",
-    "button.qwenchat-auth-pc-submit-button",
-    "input[type='password']",
-    "button:has-text('Log in')",
-    "button:has-text('Sign in')",
-    "button:has-text('登录')",
+    "#login_email",
+    "#login_password",
+    "#login",
+    "button:has-text('登 录')",
+    "a:has-text('登录')",
 ]
+# User rows include justify-end; assistant rows are animate-message-in without it.
 ASSISTANT_SELECTORS = [
-    ".response-message-content.phase-answer",
-    ".qwen-chat-message-assistant .qwen-markdown",
-    ".qwen-chat-message-assistant",
-    ".chat-response-message",
+    "div.animate-message-in.group:not(.justify-end)",
+    "div.animate-message-in:not(.justify-end) .prose-agent",
+    ".prose-agent",
 ]
 SEND_SELECTORS = [
-    "div.chat-prompt-send-button button",
-    "button:has-text('发送')",
-    "button:has-text('Send')",
+    "button[title='发送']",
+    "button[title='Send']",
+    "button:has(.enter-btn):not([disabled])",
+    "button[aria-label='Send']",
     "[aria-label*='Send']",
-    "[aria-label*='发送']",
+    "button:has-text('发送')",
 ]
 STOP_SELECTORS = [
-    "button.stop-button",
+    "button[title='取消']",
+    "button[title='停止']",
+    "button[title='Stop']",
     "button:has-text('停止')",
     "button:has-text('Stop')",
     "[aria-label*='Stop']",
     "[aria-label*='停止']",
-    "div.chat-prompt-send-button button.stop-button",
+    "[aria-label*='取消']",
+    "[role='status'][aria-live='polite']",
 ]
 NEW_CHAT_SELECTORS = [
-    "div.sidebar-entry-fixed-list-content:has-text('New Chat')",
-    "div.sidebar-entry-fixed-list-content:has-text('新对话')",
-    "div.sidebar-entry-fixed-list-content:has-text('新聊天')",
-    "button:has-text('New Chat')",
+    "button:has-text('新任务')",
+    "a:has-text('新任务')",
     "button:has-text('新对话')",
-    "a:has-text('New Chat')",
+    "button:has-text('New Chat')",
+    "button:has-text('新建')",
     "a:has-text('新对话')",
+    "a:has-text('New Chat')",
+    "a:has-text('新建')",
 ]
 DONE_HINT_SELECTORS = [
+    "button:has-text('复制')",
+    "button:has-text('Copy')",
+    "[aria-label*='Copy']",
+    "[aria-label*='复制']",
     "button.copy-response-button",
     ".copy-response-button",
 ]
-FILE_INPUT_SELECTORS = [
-    'input[type="file"][accept*="image"]',
-    'input[type="file"][accept*="video"]',
-    'input[type="file"][accept*="audio"]',
-    'input[type="file"]',
-]
-ATTACH_BUTTON_SELECTORS = [
-    "button[aria-label*='Upload']",
-    "button[aria-label*='upload']",
-    "button[aria-label*='上传']",
-    "button[aria-label*='Attach']",
-    "button[aria-label*='附件']",
-    "button[aria-label*='Image']",
-    "button[aria-label*='图片']",
-    "[class*='upload-button']",
-    "[class*='attach-button']",
-    "button:has-text('上传')",
-]
-ATTACHMENT_PREVIEW_SELECTORS = [
-    ".chat-prompt img",
-    "[class*='attachment'] img",
-    "[class*='preview'] img",
-    "[class*='upload'] img",
-    ".message-input img",
-]
+
+# Agnes auth cookie / localStorage keys (avoid matching analytics like ttcsid).
+_AUTH_COOKIE_NAMES = {"token"}
+_AUTH_STORAGE_KEYS = {"token", "userinfo"}
 
 
-class QwenClient:
+class AgnesClient:
     """Browser pool: N Playwright workers run chats in parallel."""
 
     def __init__(
@@ -159,16 +134,16 @@ class QwenClient:
     ) -> None:
         self.headless = config.headless if headless is None else headless
         self.timeout_ms = int(
-            config.qwen_timeout_ms if timeout_ms is None else timeout_ms
+            config.agnes_timeout_ms if timeout_ms is None else timeout_ms
         )
         self.browser_channel = config.browser_channel
         self.executable_path = config.chrome_path
-        self.username = config.qwen_username
-        self.password = config.qwen_password
-        self.auto_login = config.qwen_auto_login
+        self.username = config.agnes_username
+        self.password = config.agnes_password
+        self.auto_login = config.agnes_auto_login
         self.worker_count = max(
             1,
-            min(4, int(config.qwen_workers if workers is None else workers)),
+            min(4, int(config.agnes_workers if workers is None else workers)),
         )
 
         self._slots: list[_WorkerSlot] = [
@@ -184,12 +159,12 @@ class QwenClient:
             thread = threading.Thread(
                 target=self._worker_loop,
                 args=(slot,),
-                name=f"qwen-playwright-{slot.worker_id}",
+                name=f"agnes-playwright-{slot.worker_id}",
                 daemon=True,
             )
             thread.start()
             self._threads.append(thread)
-        logger.info("qwen: pool workers=%s", self.worker_count)
+        logger.info("agnes: pool workers=%s", self.worker_count)
 
     def _worker_loop(self, slot: _WorkerSlot) -> None:
         while True:
@@ -231,7 +206,7 @@ class QwenClient:
     def _current_slot(self) -> _WorkerSlot:
         slot = getattr(_tls, "slot", None)
         if slot is None:
-            raise RuntimeError("qwen browser call must run on a worker thread")
+            raise RuntimeError("agnes browser call must run on a worker thread")
         return slot
 
     def _pick_slot(self) -> _WorkerSlot:
@@ -330,7 +305,7 @@ class QwenClient:
             "state": state,
             "url": slot.page.url,
             "busy": slot.busy,
-            "logged_in": self._has_token_cookie_in(slot.context),
+            "logged_in": self._has_token_cookie_in(slot.context, slot.page),
         }
 
     def _publish_status(self) -> None:
@@ -388,9 +363,9 @@ class QwenClient:
         try:
             self._submit_all(self._stop_impl)
         except Exception:
-            logger.exception("qwen worker pool stop failed")
+            logger.exception("agnes worker pool stop failed")
         self._publish_status()
-        logger.info("qwen worker pool browsers closed workers=%s", self.worker_count)
+        logger.info("agnes worker pool browsers closed workers=%s", self.worker_count)
 
     def _stop_impl(self) -> None:
         self._stop_unlocked()
@@ -435,7 +410,7 @@ class QwenClient:
             if not ok or state != "chat":
                 raise RuntimeError(self._login_failed_message())
         elif state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -458,7 +433,7 @@ class QwenClient:
         }
 
     def _login_failed_message(self) -> str:
-        return "auto login failed; check QWEN_USERNAME/QWEN_PASSWORD in .env"
+        return "auto login failed; check AGNES_USERNAME/AGNES_PASSWORD in .env"
 
     def ask(
         self,
@@ -469,16 +444,10 @@ class QwenClient:
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
-        images: list[str] | None = None,
     ) -> dict[str, Any]:
         question = (question or "").strip()
-        image_list = [str(x).strip() for x in (images or []) if str(x).strip()]
-        if len(image_list) > MAX_IMAGES:
-            raise ValueError(f"too many images (max {MAX_IMAGES})")
-        if not question and not image_list:
+        if not question:
             raise ValueError("question is empty")
-        if not question and image_list:
-            question = "请描述这张图片" if len(image_list) == 1 else "请理解这些图片"
 
         resolved_mode = self._normalize_mode(mode)
         timeout_s = self._resolve_chat_timeout_s(
@@ -497,7 +466,6 @@ class QwenClient:
                         deep_thinking=deep_thinking,
                         search=search,
                         timeout_s=timeout_s,
-                        images=image_list,
                     )
                 )
             except TimeoutError as exc:
@@ -525,8 +493,8 @@ class QwenClient:
         if timeout_s is not None:
             return max(30, int(timeout_s))
         if deep_thinking:
-            return max(30, config.qwen_think_timeout_s)
-        return max(30, config.qwen_chat_timeout_s)
+            return max(30, config.agnes_think_timeout_s)
+        return max(30, config.agnes_chat_timeout_s)
 
     def _ask_impl(
         self,
@@ -537,21 +505,19 @@ class QwenClient:
         deep_thinking: bool,
         search: bool,
         timeout_s: int,
-        images: list[str],
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
         slot = self._current_slot()
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
         logger.info(
-            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s images=%s chars=%s timeout_s=%s question=%s",
+            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s chars=%s timeout_s=%s question=%s",
             slot.worker_id,
             state,
             conversation_id,
             mode,
             deep_thinking,
             search,
-            len(images),
             len(question),
             timeout_s,
             question,
@@ -559,29 +525,29 @@ class QwenClient:
         if self._needs_account_login() and not self._has_token_cookie():
             if not self._ensure_logged_in(page, force=True):
                 raise RuntimeError(
-                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env "
+                    "not logged in; check AGNES_USERNAME/AGNES_PASSWORD in .env "
                     f"(sqlite={db_mgr.path()})"
                 )
             state = self._detect_shell_state(page)
         elif state == "auth":
             if not self._ensure_logged_in(page):
                 raise RuntimeError(
-                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env "
+                    "not logged in; check AGNES_USERNAME/AGNES_PASSWORD in .env "
                     f"(sqlite={db_mgr.path()})"
                 )
             state = self._detect_shell_state(page)
 
         if state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
                     raise RuntimeError(
-                        "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
+                        "not logged in; check AGNES_USERNAME/AGNES_PASSWORD in .env"
                     )
             elif state == "auth" and not self._ensure_logged_in(page):
                 raise RuntimeError(
-                    "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
+                    "not logged in; check AGNES_USERNAME/AGNES_PASSWORD in .env"
                 )
             state = self._detect_shell_state(page)
             if state != "chat":
@@ -600,28 +566,28 @@ class QwenClient:
             switch_mode=not bool(conversation_id),
         )
 
-        temp_dir: Path | None = None
-        try:
-            before = self._assistant_count(page)
-            if images:
-                temp_dir, local_paths = self._materialize_images(images)
-                self._attach_images(page, local_paths)
-            self._enter_message(page, question)
-            self._send_message(page)
-            answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
-        finally:
-            if temp_dir is not None:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
+        before = self._assistant_count(page)
+        self._enter_message(page, question)
+        self._send_message(page)
+        answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
         self._save_storage_unlocked()
 
-        conv_id = self._conversation_id_from_url(page.url) or conversation_id
+        conv_id = self._wait_conversation_id(
+            page,
+            fallback=conversation_id,
+            timeout_s=20,
+        )
         if not conv_id:
-            raise RuntimeError("conversation_id missing after reply; Qwen URL has no chat id")
+            raise RuntimeError(
+                "conversation_id missing after reply; expected ?conversationId=..."
+            )
+        if not page.url or "conversationId=" not in page.url:
+            # Keep a canonical URL even if the SPA lagged updating location.
+            page_url = self._conversation_url(conv_id)
+        else:
+            page_url = page.url
 
         title = question.replace("\n", " ").strip()[:40] or None
-        if images and (not title or title.startswith("请描述") or title.startswith("请理解")):
-            title = f"图片理解({len(images)})"
         db_mgr.upsert_conversation(
             conversation_id=conv_id,
             provider=PROVIDER,
@@ -629,7 +595,7 @@ class QwenClient:
             mode=mode,
             deep_thinking=deep_thinking,
             search=search,
-            url=page.url,
+            url=page_url,
         )
         db_mgr.add_conversation_messages(
             conv_id,
@@ -637,11 +603,10 @@ class QwenClient:
         )
 
         logger.info(
-            "ask done worker=%s answer_chars=%s conv=%s images=%s elapsed=%.1fs answer=%s",
+            "ask done worker=%s answer_chars=%s conv=%s elapsed=%.1fs answer=%s",
             slot.worker_id,
             len(answer),
             conv_id,
-            len(images),
             time.perf_counter() - t0,
             answer,
         )
@@ -653,9 +618,8 @@ class QwenClient:
             "deep_thinking": deep_thinking,
             "search": search,
             "conversation_id": conv_id,
-            "url": page.url,
+            "url": page_url,
             "worker_id": slot.worker_id,
-            "image_count": len(images),
         }
 
     @staticmethod
@@ -664,7 +628,6 @@ class QwenClient:
         key = raw.lower()
         if key in MODE_ALIASES:
             return MODE_ALIASES[key]
-        # Allow passing a concrete model label, e.g. "Qwen3.5-Plus".
         if raw and raw.lower() != "auto":
             return raw
         return "auto"
@@ -678,6 +641,8 @@ class QwenClient:
         search: bool,
         switch_mode: bool = True,
     ) -> str:
+        # Agnes UI may not expose model / think / search toggles; keep stubs
+        # so ask() API stays compatible with qwen / chat_jobs.
         actual_mode = mode
         if switch_mode and mode and mode != "auto":
             actual_mode = self._select_model(page, mode) or mode
@@ -686,206 +651,75 @@ class QwenClient:
         return actual_mode
 
     def _select_model(self, page: Page, mode: str) -> str | None:
-        trigger = page.locator(
-            "[class*='model-selector-text'], "
-            "div[class*='model-selector'], "
-            "button:has-text('Qwen')"
-        )
-        if trigger.count() == 0:
-            logger.warning("model selector not found; keep mode=%s", mode)
-            return None
-        try:
-            trigger.first.click(timeout=5_000)
-            time.sleep(0.4)
-        except Exception as exc:
-            logger.warning("open model selector failed: %s", exc)
-            return None
-
-        popup = page.locator("div[class*='model-selector-popup'], [role='menu'], ul")
-        option = page.locator(
-            f"div[class*='model-selector-popup'] *:has-text('{mode}'), "
-            f"[role='menuitem']:has-text('{mode}'), "
-            f"li:has-text('{mode}'), "
-            f"div:has-text('{mode}')"
-        )
-        try:
-            if option.count() > 0:
-                option.first.click(timeout=5_000)
-                logger.info("model set to %s", mode)
-                time.sleep(0.3)
-                return mode
-        except Exception as exc:
-            logger.warning("select model %s failed: %s", mode, exc)
-        finally:
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            _ = popup
-        logger.warning("model option not found: %s", mode)
-        return None
+        _ = page
+        logger.info("agnes model switch no-op; keep mode=%s", mode)
+        return mode
 
     def _set_thinking_mode(self, page: Page, *, enabled: bool) -> None:
-        """Qwen thinking control: Thinking / Fast (or 思考 / 快速)."""
-        wanted = ("Thinking", "思考", "深度思考") if enabled else ("Fast", "快速", "极速")
-        trigger = page.locator(
-            "span.ant-select-selection-item:has(div.qwen-select-thinking-label), "
-            "div.qwen-select-thinking-label, "
-            "span.qwen-select-thinking-label-text"
-        )
-        if trigger.count() == 0:
-            # Fallback text buttons.
-            for text in ("深度思考", "Thinking", "思考"):
-                loc = page.locator(
-                    f"button:has-text('{text}'), [role='button']:has-text('{text}')"
-                )
-                if loc.count() == 0:
-                    continue
-                btn = loc.first
-                class_attr = (btn.get_attribute("class") or "").lower()
-                aria = (btn.get_attribute("aria-pressed") or "").lower()
-                active = (
-                    "active" in class_attr
-                    or "selected" in class_attr
-                    or aria == "true"
-                )
-                if active != enabled:
-                    try:
-                        btn.click(timeout=3_000)
-                        logger.info("thinking toggled via text=%s enabled=%s", text, enabled)
-                        time.sleep(0.2)
-                    except Exception:
-                        continue
-                return
-            if enabled:
-                logger.warning("thinking control not found")
-            return
-
-        try:
-            current = (
-                page.locator("span.qwen-select-thinking-label-text").first.inner_text(
-                    timeout=2_000
-                )
-                or ""
-            ).strip()
-        except Exception:
-            current = ""
-        if any(w.lower() in current.lower() for w in wanted):
-            logger.info("thinking already=%s current=%s", enabled, current)
-            return
-
-        try:
-            trigger.first.click(timeout=4_000)
-            time.sleep(0.3)
-        except Exception as exc:
-            logger.warning("open thinking dropdown failed: %s", exc)
-            return
-
-        clicked = False
-        for label in wanted:
-            opt = page.locator(
-                f"div.rc-virtual-list-holder-inner *:has-text('{label}'), "
-                f"div.qwen-select-thinking-label:has-text('{label}'), "
-                f"[role='option']:has-text('{label}'), "
-                f"li:has-text('{label}')"
-            )
-            if opt.count() == 0:
-                continue
-            try:
-                opt.first.click(timeout=3_000)
-                clicked = True
-                logger.info("thinking set to %s", label)
-                time.sleep(0.2)
-                break
-            except Exception:
-                continue
-        if not clicked and enabled:
-            logger.warning("thinking option not found wanted=%s", wanted)
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
+        _ = page
+        logger.debug("agnes thinking toggle no-op enabled=%s", enabled)
 
     def _set_search_mode(self, page: Page, *, enabled: bool) -> None:
-        """Toggle web search via mode-select (best-effort)."""
-        container = page.locator("div.mode-select-current-mode")
-        currently_on = container.count() > 0 and container.first.is_visible()
-        if currently_on and not enabled:
-            close = page.locator("span.mode-select-current-mode-close")
-            if close.count() > 0:
-                try:
-                    close.first.click(timeout=3_000)
-                    logger.info("search disabled")
-                    time.sleep(0.2)
-                except Exception as exc:
-                    logger.warning("disable search failed: %s", exc)
-            return
-        if currently_on and enabled:
-            logger.info("search already enabled")
-            return
-        if not enabled:
-            return
-
-        trigger = page.locator(
-            "div.mode-select-open, div.mode-select, "
-            "button:has-text('搜索'), button:has-text('Search'), "
-            "[aria-label*='Search'], [aria-label*='搜索']"
-        )
-        if trigger.count() == 0:
-            logger.warning("search control not found")
-            return
-        try:
-            trigger.first.click(timeout=4_000)
-            time.sleep(0.3)
-        except Exception as exc:
-            logger.warning("open search menu failed: %s", exc)
-            return
-
-        option = page.locator(
-            "ul.ant-dropdown-menu-root.qwen-dropdown-menu li:has-text('搜索'), "
-            "ul.ant-dropdown-menu-root li:has-text('Search'), "
-            "ul.ant-dropdown-menu-root li:has-text('Web'), "
-            "li[data-menu-id]:has-text('搜索'), "
-            "li[data-menu-id]:has-text('Search')"
-        )
-        if option.count() == 0:
-            logger.warning("search menu item not found")
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return
-        try:
-            option.first.click(timeout=3_000)
-            logger.info("search enabled")
-            time.sleep(0.2)
-        except Exception as exc:
-            logger.warning("enable search failed: %s", exc)
+        _ = page
+        logger.debug("agnes search toggle no-op enabled=%s", enabled)
 
     def _conversation_id_from_url(self, url: str) -> str | None:
-        match = CONVERSATION_ID_RE.search(url or "")
-        if not match:
-            return None
-        conv = match.group(1).strip()
-        if not conv or conv.lower() in RESERVED_CONV_IDS:
-            return None
-        return conv
+        raw = url or ""
+        for pattern in CONVERSATION_ID_PATTERNS:
+            match = pattern.search(raw)
+            if not match:
+                continue
+            conv = match.group(1).strip()
+            try:
+                conv = unquote(conv)
+            except Exception:
+                pass
+            if not conv or conv.lower() in RESERVED_CONV_IDS:
+                continue
+            return conv
+        return None
+
+    def _conversation_url(self, conversation_id: str) -> str:
+        return f"{CHAT_URL.rstrip('/')}/?conversationId={conversation_id}"
+
+    def _wait_conversation_id(
+        self,
+        page: Page,
+        *,
+        fallback: str | None = None,
+        timeout_s: float = 30,
+    ) -> str | None:
+        deadline = time.time() + max(1.0, float(timeout_s))
+        while time.time() < deadline:
+            conv = self._conversation_id_from_url(page.url)
+            if conv:
+                return conv
+            time.sleep(0.25)
+        return self._conversation_id_from_url(page.url) or fallback
 
     def _open_conversation(self, page: Page, conversation_id: str) -> None:
         conv = conversation_id.strip()
-        match = CONVERSATION_ID_RE.search(conv)
-        if match:
-            conv = match.group(1)
+        parsed = self._conversation_id_from_url(conv)
+        if parsed:
+            conv = parsed
+        # Also accept bare id or full URL containing conversationId=.
+        if "conversationId=" in conv:
+            parsed = self._conversation_id_from_url(
+                conv if "://" in conv else f"{CHAT_URL}?{conv}"
+            )
+            if parsed:
+                conv = parsed
         if not conv or conv.lower() in RESERVED_CONV_IDS:
             raise ValueError(f"invalid conversation_id: {conversation_id}")
 
         record = db_mgr.get_conversation(conv)
-        target = (record or {}).get("url") or f"{CHAT_URL.rstrip('/')}/c/{conv}"
+        stored_url = (record or {}).get("url")
+        target = str(stored_url) if stored_url else self._conversation_url(conv)
         if self._conversation_id_from_url(page.url) == conv:
             logger.info("already on conversation id=%s", conv)
             return
         logger.info("open conversation id=%s url=%s", conv, target)
-        page.goto(str(target), wait_until="domcontentloaded")
+        self._goto(page, str(target))
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state != "chat":
             raise RuntimeError(f"failed to open conversation {conv}, state={state}")
@@ -948,7 +782,6 @@ class QwenClient:
                 f"Tried: {detail}"
             ) from exc
 
-
     def _start_unlocked(self) -> None:
         slot = self._current_slot()
         if slot.page is not None:
@@ -988,7 +821,7 @@ class QwenClient:
                     : originalQuery(parameters);
             """
         )
-        slot.page.goto(CHAT_URL, wait_until="domcontentloaded")
+        self._goto(slot.page, CHAT_URL)
         state = self._wait_shell_state(slot.page, timeout_ms=60_000)
         logger.debug(
             "chat page ready worker=%s state=%s url=%s",
@@ -996,6 +829,48 @@ class QwenClient:
             state,
             slot.page.url,
         )
+
+    def _goto(
+        self,
+        page: Page,
+        url: str,
+        *,
+        wait_until: str = "commit",
+        attempts: int = 3,
+        timeout_ms: int | None = None,
+    ) -> None:
+        """Navigate without waiting for a full domcontentloaded.
+
+        Agnes is a heavy SPA: under headless, domcontentloaded often hangs for
+        the full UI timeout even though the document has already committed.
+        Use commit (+ short best-effort settle), and retry only if that fails.
+        """
+        del wait_until  # Agnes always uses commit; keep kw for call-site compat.
+        timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        soft_timeout = min(30_000, max(5_000, timeout))
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                page.goto(url, wait_until="commit", timeout=soft_timeout)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "goto stuck attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    attempts,
+                    url,
+                    exc,
+                )
+                if attempt >= attempts:
+                    break
+                time.sleep(1.0)
+        assert last_exc is not None
+        raise last_exc
 
     def _stop_unlocked(self) -> None:
         slot = self._current_slot()
@@ -1025,23 +900,65 @@ class QwenClient:
         return slot.page
 
     @staticmethod
-    def _has_token_cookie_in(context: BrowserContext | None) -> bool:
-        if context is None:
+    def _cookie_looks_authed(cookie: dict[str, Any]) -> bool:
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "").lower()
+        if name not in _AUTH_COOKIE_NAMES or not value:
+            return False
+        return "agnes-ai.com" in domain
+
+    def _local_storage_looks_authed(self, page: Page | None) -> bool:
+        if page is None:
             return False
         try:
-            cookies = context.cookies()
+            keys = page.evaluate("() => Object.keys(window.localStorage || {})")
         except Exception:
             return False
-        for cookie in cookies:
-            name = str(cookie.get("name") or "")
-            value = str(cookie.get("value") or "")
-            domain = str(cookie.get("domain") or "")
-            if name == "token" and value and "qwen.ai" in domain:
-                return True
-        return False
+        if not isinstance(keys, list):
+            return False
+        return any(str(key or "") in _AUTH_STORAGE_KEYS for key in keys)
+
+    def _ui_looks_logged_in(self, page: Page | None) -> bool:
+        if page is None:
+            return False
+        url = (page.url or "").lower()
+        if "/login" in url:
+            return False
+        if not self._has_visible(page, CHAT_READY_SELECTORS):
+            return False
+        # Header "登录" link or oauth popup => guest.
+        try:
+            login_btn = page.locator(
+                "a:has-text('登录'), button:has-text('登录'), "
+                "button.oauthButtons_loginBtn__eWwPG, [class*='oauthButtons_loginBtn']"
+            )
+            count = min(login_btn.count(), 6)
+            for i in range(count):
+                if login_btn.nth(i).is_visible():
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _has_token_cookie_in(
+        self,
+        context: BrowserContext | None,
+        page: Page | None = None,
+    ) -> bool:
+        if context is not None:
+            try:
+                cookies = context.cookies()
+            except Exception:
+                cookies = []
+            for cookie in cookies:
+                if self._cookie_looks_authed(cookie):
+                    return True
+        return self._local_storage_looks_authed(page)
 
     def _has_token_cookie(self) -> bool:
-        return self._has_token_cookie_in(self._current_slot().context)
+        slot = self._current_slot()
+        return self._has_token_cookie_in(slot.context, slot.page)
 
     def _needs_account_login(self) -> bool:
         return bool(self.auto_login and self.username and self.password)
@@ -1054,10 +971,10 @@ class QwenClient:
             # Guest chat UI is usable without login cookie.
             return True
         if not self.auto_login:
-            logger.warning("auth page but QWEN_AUTO_LOGIN disabled")
+            logger.warning("auth page but AGNES_AUTO_LOGIN disabled")
             return False
         if not self.username or not self.password:
-            logger.warning("auth page but QWEN_USERNAME/QWEN_PASSWORD missing in .env")
+            logger.warning("auth page but AGNES_USERNAME/AGNES_PASSWORD missing in .env")
             return False
         try:
             self._password_login(page)
@@ -1087,35 +1004,52 @@ class QwenClient:
             self.username,
             self._current_slot().worker_id,
         )
-        if "/auth" not in (page.url or "").lower():
-            page.goto(AUTH_URL, wait_until="domcontentloaded")
-        page.wait_for_load_state("domcontentloaded")
+        if "/login" not in (page.url or "").lower():
+            self._goto(page, AUTH_URL)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except Exception:
+            pass
         time.sleep(0.8)
 
+        # Prefer email tab when phone/other tabs are present.
+        email_tab = page.locator(
+            "button:has-text('邮箱'), [role='tab']:has-text('邮箱')"
+        )
+        if email_tab.count() > 0:
+            try:
+                email_tab.first.click(timeout=5_000)
+                time.sleep(0.3)
+            except Exception as exc:
+                logger.warning("click email tab failed: %s", exc)
+
         page.wait_for_selector(
-            ".qwenchat-auth-pc-input-items, input[type='password']",
+            "#login_email, #login_password, input[type='password']",
             timeout=30_000,
         )
 
-        root = page.locator(".qwenchat-auth-pc-input-items")
-        if root.count() > 0:
-            account = root.first.locator("input:not([type='password'])")
-        else:
-            account = page.locator(
-                "input[type='email'], input[placeholder*='邮箱'], "
-                "input[placeholder*='Email'], input[autocomplete='username'], "
-                "input:not([type='password'])"
+        email = page.locator("#login_email")
+        if email.count() == 0:
+            email = page.locator(
+                "input[name='login_email'], input[type='email'], "
+                "input[placeholder*='邮箱'], input[placeholder*='Email']"
             )
-        if account.count() == 0:
-            raise RuntimeError("login account input not found")
-        account.first.fill(self.username, timeout=15_000)
-        page.locator("input[type='password']").first.fill(self.password, timeout=15_000)
+        if email.count() == 0:
+            raise RuntimeError("login email input not found")
+        email.first.fill(self.username, timeout=15_000)
 
-        submit = page.locator("button.qwenchat-auth-pc-submit-button")
+        password = page.locator("#login_password")
+        if password.count() == 0:
+            password = page.locator("input[name='login_password'], input[type='password']")
+        if password.count() == 0:
+            raise RuntimeError("login password input not found")
+        password.first.fill(self.password, timeout=15_000)
+
+        submit = page.locator("button#login")
         if submit.count() == 0:
             submit = page.locator(
-                "button:has-text('登录'), button:has-text('Log in'), "
-                "button:has-text('Sign in'), button[type='submit']"
+                "button:has-text('登 录'), button:has-text('登录'), "
+                "button[type='submit']"
             )
         if submit.count() == 0:
             raise RuntimeError("login button not found")
@@ -1123,14 +1057,17 @@ class QwenClient:
 
         deadline = time.time() + 90
         while time.time() < deadline:
-            if self._has_token_cookie() or self._detect_shell_state(page) == "chat":
+            left_login = "/login" not in (page.url or "").lower()
+            if self._has_token_cookie() or (
+                left_login and self._detect_shell_state(page) == "chat"
+            ):
                 break
             time.sleep(0.5)
         else:
-            raise RuntimeError("login submit did not set token cookie")
+            raise RuntimeError("login submit did not leave login / set auth")
 
         if self._detect_shell_state(page) != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
                 raise RuntimeError("login submit did not reach chat UI")
 
@@ -1155,11 +1092,14 @@ class QwenClient:
         return False
 
     def _detect_shell_state(self, page: Page) -> str:
+        url = (page.url or "").lower()
+        if any(token in url for token in ("/login", "/auth", "sign_in", "signin")):
+            if self._has_visible(page, SIGN_IN_SELECTORS):
+                return "auth"
+            # Still on login URL even without form yet.
+            return "auth"
         if self._has_visible(page, CHAT_READY_SELECTORS):
             return "chat"
-        url = (page.url or "").lower()
-        if any(token in url for token in ("/auth", "sign_in", "signin", "login")):
-            return "auth"
         if self._has_visible(page, SIGN_IN_SELECTORS):
             return "auth"
         return "unknown"
@@ -1180,194 +1120,62 @@ class QwenClient:
                 return loc.first
         raise RuntimeError("message textarea not found")
 
-    def _materialize_images(self, images: list[str]) -> tuple[Path, list[Path]]:
-        temp_dir = Path(tempfile.mkdtemp(prefix="qwen_img_"))
-        paths: list[Path] = []
-        try:
-            for idx, src in enumerate(images):
-                paths.append(self._materialize_one_image(src, temp_dir, idx))
-        except Exception:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise
-        return temp_dir, paths
-
-    def _materialize_one_image(self, src: str, temp_dir: Path, idx: int) -> Path:
-        text = (src or "").strip()
-        if not text:
-            raise ValueError("empty image source")
-
-        local = Path(text)
-        if local.is_file():
-            raw = local.read_bytes()
-            if len(raw) > MAX_IMAGE_BYTES:
-                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
-            suffix = local.suffix or ".png"
-            dest = temp_dir / f"img_{idx}{suffix}"
-            dest.write_bytes(raw)
-            return dest
-
-        match = DATA_URL_RE.match(text)
-        if match:
-            mime = match.group(1).lower()
-            try:
-                raw = base64.b64decode(match.group(2), validate=False)
-            except Exception as exc:
-                raise ValueError("invalid image base64 data URL") from exc
-            if len(raw) > MAX_IMAGE_BYTES:
-                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
-            suffix = mimetypes.guess_extension(mime) or ".png"
-            if suffix == ".jpe":
-                suffix = ".jpg"
-            dest = temp_dir / f"img_{idx}{suffix}"
-            dest.write_bytes(raw)
-            return dest
-
-        lower = text.lower()
-        if lower.startswith("http://") or lower.startswith("https://"):
-            try:
-                req = urllib.request.Request(
-                    text,
-                    headers={"User-Agent": "mock-agent-qwen/1.0"},
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    raw = resp.read()
-                    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-            except urllib.error.URLError as exc:
-                raise ValueError(f"failed to download image: {exc}") from exc
-            if len(raw) > MAX_IMAGE_BYTES:
-                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
-            if content_type.startswith("image/"):
-                suffix = mimetypes.guess_extension(content_type) or ".png"
-            else:
-                suffix = Path(urlparse(text).path).suffix or ".png"
-            if suffix == ".jpe":
-                suffix = ".jpg"
-            dest = temp_dir / f"img_{idx}{suffix}"
-            dest.write_bytes(raw)
-            return dest
-
-        # Raw base64 (optional data-url-less payload).
-        try:
-            raw = base64.b64decode(text, validate=False)
-        except Exception as exc:
-            raise ValueError("image must be data URL, http(s) URL, or base64") from exc
-        if not raw:
-            raise ValueError("empty image base64")
-        if len(raw) > MAX_IMAGE_BYTES:
-            raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
-        dest = temp_dir / f"img_{idx}.png"
-        dest.write_bytes(raw)
-        return dest
-
-    def _find_file_input(self, page: Page):
-        for selector in FILE_INPUT_SELECTORS:
-            loc = page.locator(selector)
-            try:
-                if loc.count() > 0:
-                    return loc.first
-            except Exception:
-                continue
-        return None
-
-    def _attach_images(self, page: Page, paths: list[Path]) -> None:
-        if not paths:
-            return
-        files = [str(p) for p in paths]
-        logger.info("attach images count=%s", len(files))
-
-        file_input = self._find_file_input(page)
-        if file_input is not None:
-            try:
-                file_input.set_input_files(files)
-                self._wait_attachments_ready(page, expect_count=len(files))
-                return
-            except Exception:
-                logger.exception("set_input_files on existing input failed; try filechooser")
-
-        # Some builds only create the input after clicking an attach control.
-        for selector in ATTACH_BUTTON_SELECTORS:
-            loc = page.locator(selector)
-            try:
-                if loc.count() == 0 or not loc.first.is_visible():
-                    continue
-                with page.expect_file_chooser(timeout=5_000) as fc_info:
-                    loc.first.click(timeout=5_000)
-                chooser = fc_info.value
-                chooser.set_files(files)
-                self._wait_attachments_ready(page, expect_count=len(files))
-                return
-            except Exception:
-                continue
-
-        # Last resort: inject a temporary file input (works if page listens globally).
-        try:
-            page.evaluate(
-                """() => {
-                    let input = document.getElementById('mock-agent-qwen-file-input');
-                    if (!input) {
-                        input = document.createElement('input');
-                        input.type = 'file';
-                        input.accept = 'image/*';
-                        input.multiple = true;
-                        input.style.display = 'none';
-                        input.id = 'mock-agent-qwen-file-input';
-                        document.body.appendChild(input);
-                    }
-                }"""
-            )
-            locator = page.locator("#mock-agent-qwen-file-input")
-            locator.set_input_files(files)
-            self._wait_attachments_ready(page, expect_count=len(files))
-            return
-        except Exception as exc:
-            raise RuntimeError(f"failed to attach images on Qwen UI: {exc}") from exc
-
-    def _wait_attachments_ready(self, page: Page, *, expect_count: int) -> None:
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if self._has_visible(page, ATTACHMENT_PREVIEW_SELECTORS):
-                time.sleep(0.4)
-                return
-            # Upload may still be in progress even without a clear preview node.
-            try:
-                for selector in FILE_INPUT_SELECTORS:
-                    loc = page.locator(selector)
-                    if loc.count() == 0:
-                        continue
-                    # files property isn't always exposed; just wait a bit after set.
-                    break
-            except Exception:
-                pass
-            time.sleep(0.25)
-        logger.warning(
-            "attachment preview not confirmed expect_count=%s; continue anyway",
-            expect_count,
-        )
-        time.sleep(1.0)
-
     def _enter_message(self, page: Page, message: str) -> None:
         box = self._textarea(page)
         box.click()
-        box.fill(message)
+        tag = ""
+        try:
+            tag = (box.evaluate("el => el.tagName") or "").upper()
+        except Exception:
+            tag = ""
+        if tag == "TEXTAREA" or tag == "INPUT":
+            box.fill(message)
+            return
+        # Logged-in Agnes composer is a contenteditable div.
+        try:
+            box.fill(message)
+            return
+        except Exception:
+            pass
+        page.keyboard.press("Meta+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.type(message, delay=10)
 
     def _send_message(self, page: Page) -> None:
-        for selector in SEND_SELECTORS:
-            loc = page.locator(selector)
-            try:
-                if loc.count() == 0 or not loc.first.is_visible():
+        # Composer fill may take a beat before Agnes enables the send button.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            for selector in SEND_SELECTORS:
+                loc = page.locator(selector)
+                try:
+                    if loc.count() == 0 or not loc.first.is_visible():
+                        continue
+                    disabled = loc.first.get_attribute("disabled")
+                    aria = loc.first.get_attribute("aria-disabled")
+                    if disabled is not None or aria == "true":
+                        continue
+                    cls = (loc.first.get_attribute("class") or "").lower()
+                    title = (loc.first.get_attribute("title") or "").lower()
+                    if "stop" in cls or title in {"取消", "停止", "stop"}:
+                        continue
+                    loc.first.click(timeout=5_000)
+                    return
+                except Exception:
                     continue
-                disabled = loc.first.get_attribute("disabled")
-                aria = loc.first.get_attribute("aria-disabled")
-                if disabled is not None or aria == "true":
-                    continue
-                cls = (loc.first.get_attribute("class") or "").lower()
-                if "stop" in cls:
-                    continue
-                loc.first.click(timeout=5_000)
-                return
-            except Exception:
-                continue
-        self._textarea(page).press("Enter")
+            time.sleep(0.2)
+        # Last resort: Enter on some builds submits; contenteditable often needs Ctrl/Meta+Enter.
+        box = self._textarea(page)
+        try:
+            box.press("Control+Enter")
+            return
+        except Exception:
+            pass
+        try:
+            box.press("Meta+Enter")
+            return
+        except Exception:
+            pass
+        box.press("Enter")
 
     def _open_new_chat(self, page: Page) -> None:
         for selector in NEW_CHAT_SELECTORS:
@@ -1379,7 +1187,7 @@ class QwenClient:
                     return
             except Exception:
                 continue
-        page.goto(f"{CHAT_URL.rstrip('/')}/c/new-chat", wait_until="domcontentloaded")
+        self._goto(page, CHAT_URL)
         self._wait_shell_state(page, timeout_ms=30_000)
 
     def _assistant_locator(self, page: Page):
@@ -1396,34 +1204,78 @@ class QwenClient:
             return 0
 
     def _last_assistant_text(self, page: Page) -> str:
-        loc = self._assistant_locator(page)
-        count = loc.count()
-        if count <= 0:
-            return ""
+        # Prefer the last assistant message row; answer lives in .prose-agent
+        # (reasoning is .prose-reasoning / "Thought").
+        rows = page.locator("div.animate-message-in.group:not(.justify-end)")
         try:
+            count = rows.count()
+        except Exception:
+            count = 0
+        if count > 0:
+            try:
+                row = rows.nth(count - 1)
+                agents = row.locator(".prose-agent")
+                agent_n = agents.count()
+                if agent_n > 0:
+                    text = (agents.nth(agent_n - 1).inner_text() or "").strip()
+                    if text:
+                        return text
+                text = (row.inner_text() or "").strip()
+                return self._strip_thought_text(text)
+            except Exception:
+                pass
+        loc = self._assistant_locator(page)
+        try:
+            count = loc.count()
+            if count <= 0:
+                return ""
             text = (loc.nth(count - 1).inner_text() or "").strip()
-            # Strip thinking status chrome if it leaked into the node.
-            lines = [
-                line
-                for line in text.splitlines()
-                if not re.match(
-                    r"^(Thought completed|思考完成|Thinking|深度思考).*$",
-                    line.strip(),
-                    flags=re.IGNORECASE,
-                )
-            ]
-            return "\n".join(lines).strip()
+            return self._strip_thought_text(text)
         except Exception:
             return ""
+
+    @staticmethod
+    def _strip_thought_text(text: str) -> str:
+        if not text:
+            return ""
+        lines = text.splitlines()
+        out: list[str] = []
+        skipping = False
+        for line in lines:
+            stripped = line.strip()
+            if re.match(
+                r"^(Thought completed|Thought|思考完成|Thinking|深度思考)\b.*$",
+                stripped,
+                flags=re.IGNORECASE,
+            ):
+                skipping = True
+                continue
+            if skipping and not stripped:
+                skipping = False
+                continue
+            if skipping:
+                # Drop reasoning block until a blank line separates answer.
+                continue
+            out.append(line)
+        cleaned = "\n".join(out).strip()
+        return cleaned or text.strip()
 
     def _is_generating(self, page: Page) -> bool:
         for selector in STOP_SELECTORS:
             try:
                 loc = page.locator(selector)
-                count = min(loc.count(), 4)
+                count = min(loc.count(), 6)
                 for i in range(count):
-                    if loc.nth(i).is_visible():
-                        return True
+                    node = loc.nth(i)
+                    if not node.is_visible():
+                        continue
+                    # Loading status may stay in DOM empty; require content or cancel btn.
+                    if selector.startswith("[role='status']"):
+                        html = (node.inner_html() or "").lower()
+                        if "load" in html or "spin" in html or "anim" in html:
+                            return True
+                        continue
+                    return True
             except Exception:
                 continue
         return False
@@ -1480,13 +1332,13 @@ class QwenClient:
         )
 
 
-_client: QwenClient | None = None
+_client: AgnesClient | None = None
 _client_lock = threading.Lock()
 
 
-def get_client() -> QwenClient:
+def get_client() -> AgnesClient:
     global _client
     with _client_lock:
         if _client is None:
-            _client = QwenClient()
+            _client = AgnesClient()
         return _client
