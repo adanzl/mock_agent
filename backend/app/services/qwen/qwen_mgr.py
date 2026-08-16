@@ -38,6 +38,7 @@ class QwenMgr:
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         return self._get_client().ask(
             question,
@@ -46,6 +47,7 @@ class QwenMgr:
             deep_thinking=deep_thinking,
             search=search,
             timeout_s=timeout_s,
+            images=images,
         )
 
     def list_conversations(

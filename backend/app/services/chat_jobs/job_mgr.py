@@ -26,10 +26,14 @@ class ChatJobMgr:
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         question = (question or "").strip()
-        if not question:
+        image_list = [str(x) for x in (images or []) if str(x).strip()]
+        if not question and not image_list:
             raise ValueError("question is empty")
+        if not question and image_list:
+            question = "请描述这张图片" if len(image_list) == 1 else "请理解这些图片"
         job_id = str(uuid.uuid4())
         job = db_mgr.create_chat_job(
             job_id=job_id,
@@ -40,15 +44,17 @@ class ChatJobMgr:
             deep_thinking=deep_thinking,
             search=search,
             timeout_s=timeout_s,
+            images=image_list or None,
         )
         logger.info(
-            "chat job created job_id=%s provider=%s conv=%s mode=%s think=%s search=%s chars=%s question=%s",
+            "chat job created job_id=%s provider=%s conv=%s mode=%s think=%s search=%s images=%s chars=%s question=%s",
             job_id,
             provider,
             conversation_id,
             mode,
             deep_thinking,
             search,
+            len(image_list),
             len(question),
             question,
         )
@@ -81,6 +87,7 @@ class ChatJobMgr:
             "deep_thinking": bool(job.get("deep_thinking")),
             "search": bool(job.get("search")),
             "timeout_s": job.get("timeout_s"),
+            "image_count": len(job.get("images") or []),
             "created_at": job.get("created_at"),
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),

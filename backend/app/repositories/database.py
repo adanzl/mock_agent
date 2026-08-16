@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS chat_job (
     deep_thinking INTEGER NOT NULL DEFAULT 0,
     search INTEGER NOT NULL DEFAULT 0,
     timeout_s INTEGER,
+    images_json TEXT,
     result_json TEXT,
     error TEXT,
     error_kind TEXT,
@@ -103,10 +104,21 @@ class DbMgr:
             path.parent.mkdir(parents=True, exist_ok=True)
             with self.connect() as conn:
                 conn.executescript(_SCHEMA)
+                self._ensure_chat_job_images_column(conn)
                 conn.commit()
             self._initialized = True
             logger.info("sqlite ready path=%s", path)
             return path
+
+    @staticmethod
+    def _ensure_chat_job_images_column(conn: sqlite3.Connection) -> None:
+        cols = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(chat_job)").fetchall()
+        }
+        if "images_json" not in cols:
+            conn.execute("ALTER TABLE chat_job ADD COLUMN images_json TEXT")
+            logger.info("sqlite migrated chat_job.images_json")
 
     def get_browser_session(self, provider: str) -> dict[str, Any] | None:
         self.init()
@@ -281,6 +293,16 @@ class DbMgr:
         item = dict(row)
         item["deep_thinking"] = bool(item.get("deep_thinking"))
         item["search"] = bool(item.get("search"))
+        images: list[str] = []
+        images_raw = item.pop("images_json", None)
+        if images_raw:
+            try:
+                parsed = json.loads(images_raw)
+                if isinstance(parsed, list):
+                    images = [str(x) for x in parsed if str(x).strip()]
+            except json.JSONDecodeError:
+                logger.warning("invalid chat_job images_json id=%s", item.get("id"))
+        item["images"] = images
         raw = item.pop("result_json", None)
         result = None
         if raw:
@@ -304,15 +326,19 @@ class DbMgr:
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         self.init()
+        images_json = None
+        if images:
+            images_json = json.dumps(list(images), ensure_ascii=False)
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO chat_job (
                     id, provider, status, question, conversation_id, mode,
-                    deep_thinking, search, timeout_s, updated_at
-                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, datetime('now'))
+                    deep_thinking, search, timeout_s, images_json, updated_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
                 (
                     job_id,
@@ -323,6 +349,7 @@ class DbMgr:
                     1 if deep_thinking else 0,
                     1 if search else 0,
                     timeout_s,
+                    images_json,
                 ),
             )
             conn.commit()

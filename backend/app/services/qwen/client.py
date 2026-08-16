@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 import queue
 import re
+import shutil
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
@@ -22,6 +30,12 @@ CHAT_URL = "https://chat.qwen.ai/"
 AUTH_URL = "https://chat.qwen.ai/auth"
 CONVERSATION_ID_RE = re.compile(r"/c/([^/?#]+)", re.IGNORECASE)
 RESERVED_CONV_IDS = {"new-chat", "guest", "new"}
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DATA_URL_RE = re.compile(
+    r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Playwright sync API is thread-bound; each worker loop sets this.
 _tls = threading.local()
@@ -105,6 +119,31 @@ NEW_CHAT_SELECTORS = [
 DONE_HINT_SELECTORS = [
     "button.copy-response-button",
     ".copy-response-button",
+]
+FILE_INPUT_SELECTORS = [
+    'input[type="file"][accept*="image"]',
+    'input[type="file"][accept*="video"]',
+    'input[type="file"][accept*="audio"]',
+    'input[type="file"]',
+]
+ATTACH_BUTTON_SELECTORS = [
+    "button[aria-label*='Upload']",
+    "button[aria-label*='upload']",
+    "button[aria-label*='上传']",
+    "button[aria-label*='Attach']",
+    "button[aria-label*='附件']",
+    "button[aria-label*='Image']",
+    "button[aria-label*='图片']",
+    "[class*='upload-button']",
+    "[class*='attach-button']",
+    "button:has-text('上传')",
+]
+ATTACHMENT_PREVIEW_SELECTORS = [
+    ".chat-prompt img",
+    "[class*='attachment'] img",
+    "[class*='preview'] img",
+    "[class*='upload'] img",
+    ".message-input img",
 ]
 
 
@@ -440,10 +479,16 @@ class QwenClient:
         deep_thinking: bool = False,
         search: bool = False,
         timeout_s: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         question = (question or "").strip()
-        if not question:
+        image_list = [str(x).strip() for x in (images or []) if str(x).strip()]
+        if len(image_list) > MAX_IMAGES:
+            raise ValueError(f"too many images (max {MAX_IMAGES})")
+        if not question and not image_list:
             raise ValueError("question is empty")
+        if not question and image_list:
+            question = "请描述这张图片" if len(image_list) == 1 else "请理解这些图片"
 
         resolved_mode = self._normalize_mode(mode)
         timeout_s = self._resolve_chat_timeout_s(
@@ -458,6 +503,7 @@ class QwenClient:
                 deep_thinking=deep_thinking,
                 search=search,
                 timeout_s=timeout_s,
+                images=image_list,
             )
         )
 
@@ -482,19 +528,21 @@ class QwenClient:
         deep_thinking: bool,
         search: bool,
         timeout_s: int,
+        images: list[str],
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
         slot = self._current_slot()
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
         logger.info(
-            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s chars=%s timeout_s=%s question=%s",
+            "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s images=%s chars=%s timeout_s=%s question=%s",
             slot.worker_id,
             state,
             conversation_id,
             mode,
             deep_thinking,
             search,
+            len(images),
             len(question),
             timeout_s,
             question,
@@ -543,10 +591,19 @@ class QwenClient:
             switch_mode=not bool(conversation_id),
         )
 
-        before = self._assistant_count(page)
-        self._enter_message(page, question)
-        self._send_message(page)
-        answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
+        temp_dir: Path | None = None
+        try:
+            before = self._assistant_count(page)
+            if images:
+                temp_dir, local_paths = self._materialize_images(images)
+                self._attach_images(page, local_paths)
+            self._enter_message(page, question)
+            self._send_message(page)
+            answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
         self._save_storage_unlocked()
 
         conv_id = self._conversation_id_from_url(page.url) or conversation_id
@@ -554,6 +611,8 @@ class QwenClient:
             raise RuntimeError("conversation_id missing after reply; Qwen URL has no chat id")
 
         title = question.replace("\n", " ").strip()[:40] or None
+        if images and (not title or title.startswith("请描述") or title.startswith("请理解")):
+            title = f"图片理解({len(images)})"
         db_mgr.upsert_conversation(
             conversation_id=conv_id,
             provider=PROVIDER,
@@ -569,10 +628,11 @@ class QwenClient:
         )
 
         logger.info(
-            "ask done worker=%s answer_chars=%s conv=%s elapsed=%.1fs answer=%s",
+            "ask done worker=%s answer_chars=%s conv=%s images=%s elapsed=%.1fs answer=%s",
             slot.worker_id,
             len(answer),
             conv_id,
+            len(images),
             time.perf_counter() - t0,
             answer,
         )
@@ -586,6 +646,7 @@ class QwenClient:
             "conversation_id": conv_id,
             "url": page.url,
             "worker_id": slot.worker_id,
+            "image_count": len(images),
         }
 
     @staticmethod
@@ -1109,6 +1170,171 @@ class QwenClient:
             if loc.count() > 0 and loc.first.is_visible():
                 return loc.first
         raise RuntimeError("message textarea not found")
+
+    def _materialize_images(self, images: list[str]) -> tuple[Path, list[Path]]:
+        temp_dir = Path(tempfile.mkdtemp(prefix="qwen_img_"))
+        paths: list[Path] = []
+        try:
+            for idx, src in enumerate(images):
+                paths.append(self._materialize_one_image(src, temp_dir, idx))
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        return temp_dir, paths
+
+    def _materialize_one_image(self, src: str, temp_dir: Path, idx: int) -> Path:
+        text = (src or "").strip()
+        if not text:
+            raise ValueError("empty image source")
+
+        local = Path(text)
+        if local.is_file():
+            raw = local.read_bytes()
+            if len(raw) > MAX_IMAGE_BYTES:
+                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
+            suffix = local.suffix or ".png"
+            dest = temp_dir / f"img_{idx}{suffix}"
+            dest.write_bytes(raw)
+            return dest
+
+        match = DATA_URL_RE.match(text)
+        if match:
+            mime = match.group(1).lower()
+            try:
+                raw = base64.b64decode(match.group(2), validate=False)
+            except Exception as exc:
+                raise ValueError("invalid image base64 data URL") from exc
+            if len(raw) > MAX_IMAGE_BYTES:
+                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
+            suffix = mimetypes.guess_extension(mime) or ".png"
+            if suffix == ".jpe":
+                suffix = ".jpg"
+            dest = temp_dir / f"img_{idx}{suffix}"
+            dest.write_bytes(raw)
+            return dest
+
+        lower = text.lower()
+        if lower.startswith("http://") or lower.startswith("https://"):
+            try:
+                req = urllib.request.Request(
+                    text,
+                    headers={"User-Agent": "mock-agent-qwen/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read()
+                    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            except urllib.error.URLError as exc:
+                raise ValueError(f"failed to download image: {exc}") from exc
+            if len(raw) > MAX_IMAGE_BYTES:
+                raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
+            if content_type.startswith("image/"):
+                suffix = mimetypes.guess_extension(content_type) or ".png"
+            else:
+                suffix = Path(urlparse(text).path).suffix or ".png"
+            if suffix == ".jpe":
+                suffix = ".jpg"
+            dest = temp_dir / f"img_{idx}{suffix}"
+            dest.write_bytes(raw)
+            return dest
+
+        # Raw base64 (optional data-url-less payload).
+        try:
+            raw = base64.b64decode(text, validate=False)
+        except Exception as exc:
+            raise ValueError("image must be data URL, http(s) URL, or base64") from exc
+        if not raw:
+            raise ValueError("empty image base64")
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError(f"image too large (max {MAX_IMAGE_BYTES} bytes)")
+        dest = temp_dir / f"img_{idx}.png"
+        dest.write_bytes(raw)
+        return dest
+
+    def _find_file_input(self, page: Page):
+        for selector in FILE_INPUT_SELECTORS:
+            loc = page.locator(selector)
+            try:
+                if loc.count() > 0:
+                    return loc.first
+            except Exception:
+                continue
+        return None
+
+    def _attach_images(self, page: Page, paths: list[Path]) -> None:
+        if not paths:
+            return
+        files = [str(p) for p in paths]
+        logger.info("attach images count=%s", len(files))
+
+        file_input = self._find_file_input(page)
+        if file_input is not None:
+            try:
+                file_input.set_input_files(files)
+                self._wait_attachments_ready(page, expect_count=len(files))
+                return
+            except Exception:
+                logger.exception("set_input_files on existing input failed; try filechooser")
+
+        # Some builds only create the input after clicking an attach control.
+        for selector in ATTACH_BUTTON_SELECTORS:
+            loc = page.locator(selector)
+            try:
+                if loc.count() == 0 or not loc.first.is_visible():
+                    continue
+                with page.expect_file_chooser(timeout=5_000) as fc_info:
+                    loc.first.click(timeout=5_000)
+                chooser = fc_info.value
+                chooser.set_files(files)
+                self._wait_attachments_ready(page, expect_count=len(files))
+                return
+            except Exception:
+                continue
+
+        # Last resort: inject a temporary file input (works if page listens globally).
+        try:
+            page.evaluate(
+                """() => {
+                    let input = document.getElementById('mock-agent-qwen-file-input');
+                    if (!input) {
+                        input = document.createElement('input');
+                        input.type = 'file';
+                        input.accept = 'image/*';
+                        input.multiple = true;
+                        input.style.display = 'none';
+                        input.id = 'mock-agent-qwen-file-input';
+                        document.body.appendChild(input);
+                    }
+                }"""
+            )
+            locator = page.locator("#mock-agent-qwen-file-input")
+            locator.set_input_files(files)
+            self._wait_attachments_ready(page, expect_count=len(files))
+            return
+        except Exception as exc:
+            raise RuntimeError(f"failed to attach images on Qwen UI: {exc}") from exc
+
+    def _wait_attachments_ready(self, page: Page, *, expect_count: int) -> None:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self._has_visible(page, ATTACHMENT_PREVIEW_SELECTORS):
+                time.sleep(0.4)
+                return
+            # Upload may still be in progress even without a clear preview node.
+            try:
+                for selector in FILE_INPUT_SELECTORS:
+                    loc = page.locator(selector)
+                    if loc.count() == 0:
+                        continue
+                    # files property isn't always exposed; just wait a bit after set.
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+        logger.warning(
+            "attachment preview not confirmed expect_count=%s; continue anyway",
+            expect_count,
+        )
+        time.sleep(1.0)
 
     def _enter_message(self, page: Page, message: str) -> None:
         box = self._textarea(page)

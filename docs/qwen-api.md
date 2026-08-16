@@ -86,12 +86,44 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
-| `question` | string | 是 | — | 用户问题（别名：`prompt` / `message`） |
+| `question` | string | 条件必填 | — | 用户问题（别名：`prompt` / `message`）；无图时必填，有图时可省略（用默认提示） |
 | `conversation_id` | string | 否 | 无 | **有则续聊，无则新开**（别名：`chat_id`） |
 | `mode` | string | 否 | `auto` | 模型（别名：`model`）；`auto` 不切换 |
 | `deep_thinking` | bool | 否 | `false` | 深度思考 / Thinking（别名：`think` / `deep_think`） |
 | `search` | bool | 否 | `false` | 联网搜索（别名：`web_search` / `smart_search`） |
 | `timeout` | int | 否 | 见下 | 等待回复秒数；不传时：普通 `QWEN_CHAT_TIMEOUT_S`(默认 300)，深度思考用 `QWEN_THINK_TIMEOUT_S`(默认 600) |
+| `image` / `images` | string / string[] | 否 | 无 | 图片理解：公网 `http(s)` URL、`data:image/...;base64,...`、或纯 base64（别名：`image_url` / `image_base64`）。最多 4 张，单张 ≤ 10MB |
+| multipart 文件 | file | 否 | 无 | 也可用 `multipart/form-data` 上传，字段名：`image` / `images` / `file` / `files` |
+
+仅传图片、不传 `question` 时，默认问题为「请描述这张图片」/「请理解这些图片」。
+
+### 图片理解示例
+
+JSON（图片 URL）：
+
+```bash
+curl -s http://127.0.0.1:8765/api/qwen/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"图里有什么？","image":"https://example.com/demo.png"}'
+```
+
+JSON（多图 / data URL）：
+
+```bash
+curl -s http://127.0.0.1:8765/api/qwen/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"比较两张图的差异","images":["data:image/png;base64,...","data:image/jpeg;base64,..."]}'
+```
+
+multipart 本地文件：
+
+```bash
+curl -s http://127.0.0.1:8765/api/qwen/chat \
+  -F 'question=图里写了什么字？' \
+  -F 'image=@./photo.jpg'
+```
+
+成功响应会多一个 `image_count` 字段。
 
 ### `mode` 取值
 
@@ -120,7 +152,8 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
   "deep_thinking": true,
   "search": false,
   "url": "https://chat.qwen.ai/c/...",
-  "worker_id": 0
+  "worker_id": 0,
+  "image_count": 1
 }
 ```
 

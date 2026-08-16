@@ -116,14 +116,16 @@ class ChatJobRunner:
         deep_thinking = bool(job.get("deep_thinking"))
         search = bool(job.get("search"))
         timeout_s = job.get("timeout_s")
+        images = job.get("images") or []
         logger.info(
-            "chat job start job_id=%s provider=%s conv=%s mode=%s think=%s search=%s chars=%s question=%s",
+            "chat job start job_id=%s provider=%s conv=%s mode=%s think=%s search=%s images=%s chars=%s question=%s",
             job_id,
             provider,
             conversation_id,
             mode,
             deep_thinking,
             search,
+            len(images),
             len(question),
             question,
         )
@@ -138,6 +140,8 @@ class ChatJobRunner:
             }
             if mode is not None:
                 kwargs["mode"] = str(mode)
+            if images and provider == "qwen":
+                kwargs["images"] = list(images)
             result = ask(**kwargs)
         except ValueError as exc:
             db_mgr.finish_chat_job_failure(job_id, error=str(exc), error_kind="value")
