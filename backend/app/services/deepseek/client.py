@@ -71,6 +71,10 @@ SIGN_IN_SELECTORS = [
     "button:has-text('登录')",
 ]
 ASSISTANT_SELECTOR = "div.ds-message:has(.ds-markdown)"
+COMPOSER_BUTTON_SELECTORS = [
+    "div.ds-button.ds-button--circle",
+    "div.ds-icon-button",
+]
 NEW_CHAT_SELECTORS = [
     "button:has-text('新对话')",
     "button:has-text('New chat')",
@@ -78,6 +82,50 @@ NEW_CHAT_SELECTORS = [
     "button[aria-label*='新']",
     "a[href='/']",
 ]
+# Same control humans watch: empty textarea + enabled circle button = generating/stop.
+COMPOSER_STATE_JS = """() => {
+    const ta = document.querySelector('textarea');
+    const textareaLen = ta ? (ta.value || '').length : 0;
+    let root = ta;
+    let btn = null;
+    for (let i = 0; i < 10 && root; i++) {
+        btn = root.querySelector('.ds-button--circle, .ds-icon-button');
+        if (btn) break;
+        root = root.parentElement;
+    }
+    if (!btn) {
+        btn = document.querySelector('.ds-button--circle, .ds-icon-button');
+    }
+    if (!btn) {
+        return {
+            ok: false,
+            generating: false,
+            can_send: false,
+            disabled: true,
+            textarea_len: textareaLen,
+        };
+    }
+    const cls = (btn.className || '').toString();
+    const disabled = cls.includes('ds-button--disabled')
+        || btn.getAttribute('aria-disabled') === 'true'
+        || btn.hasAttribute('disabled');
+    const html = (btn.innerHTML || '').toLowerCase();
+    const svg = btn.querySelector('svg');
+    const hasRect = !!(svg && svg.querySelector('rect'));
+    const looksStop = hasRect
+        || html.includes('stop')
+        || html.includes('停止');
+    const generating = !disabled && textareaLen === 0;
+    const canSend = !disabled && textareaLen > 0 && !looksStop;
+    return {
+        ok: true,
+        generating,
+        can_send: canSend,
+        disabled,
+        textarea_len: textareaLen,
+        looks_stop: looksStop,
+    };
+}"""
 
 
 class DeepSeekClient:
@@ -487,10 +535,20 @@ class DeepSeekClient:
             switch_mode=not bool(conversation_id),
         )
 
-        before = self._assistant_count(page)
+        self._scroll_latest_into_view(page)
+        before_text = self._last_assistant_text(page)
+        if conversation_id and not before_text:
+            history_deadline = time.time() + 5
+            while time.time() < history_deadline:
+                time.sleep(0.3)
+                self._scroll_latest_into_view(page)
+                before_text = self._last_assistant_text(page)
+                if before_text:
+                    break
+        logger.info("composer before_text_chars=%s", len(before_text or ""))
         self._enter_message(page, question)
         self._send_message(page)
-        answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
+        answer = self._wait_answer(page, before_text=before_text, timeout_s=timeout_s)
         self._save_storage_unlocked()
 
         conv_id = self._conversation_id_from_url(page.url) or conversation_id
@@ -951,16 +1009,45 @@ class DeepSeekClient:
         box.click()
         box.fill(message)
 
-    def _send_message(self, page: Page) -> None:
-        send = page.locator("div.ds-icon-button").last
+    def _composer_state(self, page: Page) -> dict[str, Any]:
+        fallback = {
+            "ok": False,
+            "generating": False,
+            "can_send": False,
+            "disabled": True,
+            "textarea_len": 0,
+        }
         try:
-            if send.count() > 0 and send.is_visible():
-                disabled = send.get_attribute("aria-disabled")
-                if disabled != "true":
-                    send.click()
-                    return
+            state = page.evaluate(COMPOSER_STATE_JS)
         except Exception:
-            pass
+            return fallback
+        return state if isinstance(state, dict) else fallback
+
+    def _composer_button(self, page: Page):
+        for selector in COMPOSER_BUTTON_SELECTORS:
+            loc = page.locator(selector)
+            try:
+                if loc.count() > 0 and loc.last.is_visible():
+                    return loc.last
+            except Exception:
+                continue
+        return None
+
+    def _send_message(self, page: Page) -> None:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            state = self._composer_state(page)
+            if state.get("can_send"):
+                btn = self._composer_button(page)
+                if btn is not None:
+                    btn.click()
+                    logger.info(
+                        "composer send clicked textarea_len=%s",
+                        state.get("textarea_len"),
+                    )
+                    return
+            time.sleep(0.2)
+        logger.warning("composer send not ready; fallback Enter")
         self._textarea(page).press("Enter")
 
     def _open_new_chat(self, page: Page) -> None:
@@ -976,12 +1063,6 @@ class DeepSeekClient:
         page.goto(CHAT_URL, wait_until="domcontentloaded")
         self._wait_shell_state(page, timeout_ms=30_000)
 
-    def _assistant_count(self, page: Page) -> int:
-        try:
-            return page.locator(ASSISTANT_SELECTOR).count()
-        except Exception:
-            return 0
-
     def _last_assistant_text(self, page: Page) -> str:
         loc = page.locator(ASSISTANT_SELECTOR)
         count = loc.count()
@@ -992,56 +1073,92 @@ class DeepSeekClient:
         except Exception:
             return ""
 
-    def _is_generating(self, page: Page) -> bool:
-        """True while DeepSeek is still producing a reply (stop control visible)."""
-        selectors = [
-            "button:has-text('停止')",
-            "div[role='button']:has-text('停止')",
-            "button:has-text('Stop')",
-            "div[role='button']:has-text('Stop')",
-            "[aria-label*='Stop']",
-            "[aria-label*='停止']",
-        ]
-        for selector in selectors:
-            try:
-                loc = page.locator(selector)
-                count = min(loc.count(), 4)
-                for i in range(count):
-                    if loc.nth(i).is_visible():
-                        return True
-            except Exception:
-                continue
-        return False
+    def _scroll_latest_into_view(self, page: Page) -> None:
+        try:
+            page.evaluate(
+                """() => {
+                    let best = null;
+                    let bestOverflow = 0;
+                    for (const el of document.querySelectorAll('div')) {
+                        const overflow = el.scrollHeight - el.clientHeight;
+                        if (overflow > bestOverflow) {
+                            bestOverflow = overflow;
+                            best = el;
+                        }
+                    }
+                    if (best) best.scrollTop = best.scrollHeight;
+                    const nodes = document.querySelectorAll(
+                        'div.ds-message:has(.ds-markdown)'
+                    );
+                    const last = nodes[nodes.length - 1];
+                    if (last) last.scrollIntoView({ block: 'end' });
+                }"""
+            )
+        except Exception:
+            pass
 
-    def _wait_answer(self, page: Page, *, before_count: int, timeout_s: int) -> str:
+    def _is_generating(self, page: Page) -> bool:
+        """True while the composer button is in stop/generating state."""
+        return bool(self._composer_state(page).get("generating"))
+
+    def _wait_answer(self, page: Page, *, before_text: str, timeout_s: int) -> str:
         deadline = time.time() + timeout_s
+        started = time.time()
         previous = ""
         stable = 0
-        saw_new = False
-        # Longer quiet period for long replies / deep thinking streams.
-        need_stable = 3
+        saw_generating = False
+        idle_stable = 0
+        need_stable = 2
 
         while time.time() < deadline:
-            count = self._assistant_count(page)
-            if count > before_count:
-                saw_new = True
-            # Only read assistant text after a new bubble appears; otherwise stale
-            # text from the previous chat can be returned as a false success.
-            text = self._last_assistant_text(page) if saw_new else ""
-            generating = self._is_generating(page)
+            state = self._composer_state(page)
+            generating = bool(state.get("generating"))
             if generating:
+                if not saw_generating:
+                    logger.info("composer generating started")
+                saw_generating = True
+                idle_stable = 0
                 stable = 0
-            elif text and text == previous:
+                time.sleep(1)
+                continue
+
+            if not saw_generating:
+                textarea_len = int(state.get("textarea_len") or 0)
+                if textarea_len > 0:
+                    time.sleep(0.2)
+                    continue
+                # Fast replies can flip stop->send before the next 1s poll.
+                if time.time() - started >= 8:
+                    self._scroll_latest_into_view(page)
+                    text = self._last_assistant_text(page)
+                    if text and text != before_text:
+                        logger.info("composer missed stop; idle with new text")
+                        saw_generating = True
+                        previous = text
+                        idle_stable = 1
+                time.sleep(0.2)
+                continue
+
+            idle_stable += 1
+            self._scroll_latest_into_view(page)
+            text = self._last_assistant_text(page)
+            if text and text != before_text and text == previous:
                 stable += 1
             else:
                 stable = 0
-            previous = text
-            if saw_new and text and not generating and stable >= need_stable:
-                return text
+            if text and text != before_text:
+                previous = text
+            if (
+                idle_stable >= need_stable
+                and previous
+                and previous != before_text
+                and stable >= need_stable
+            ):
+                return previous
             time.sleep(1)
 
         generating = self._is_generating(page)
-        if saw_new and previous and not generating:
+        if previous and previous != before_text and not generating:
             logger.warning(
                 "answer wait ended with partial text chars=%s timeout_s=%s generating=%s",
                 len(previous),
@@ -1050,15 +1167,15 @@ class DeepSeekClient:
             )
             return previous
         logger.error(
-            "no complete answer within %ss saw_new=%s chars=%s generating=%s",
+            "no complete answer within %ss saw_generating=%s chars=%s generating=%s",
             timeout_s,
-            saw_new,
+            saw_generating,
             len(previous),
             generating,
         )
         raise TimeoutError(
             f"no complete answer within {timeout_s}s "
-            f"(saw_new={saw_new}, generating={generating})"
+            f"(saw_generating={saw_generating}, generating={generating})"
         )
 
 
