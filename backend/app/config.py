@@ -118,9 +118,22 @@ class Config:
             BACKEND_DIR / "data" / "chatgpt-browser",
             root=BACKEND_DIR,
         )
-        # Attach to a real Chrome via CDP (recommended for manual login).
-        # Example: http://127.0.0.1:9222
-        self.chatgpt_cdp_url: str | None = _opt("CHATGPT_CDP_URL")
+        # Auto-launch real Chrome with CDP (local default). Set 0 to attach manually.
+        self.chatgpt_auto_launch_chrome: bool = _bool(
+            "CHATGPT_AUTO_LAUNCH_CHROME", True
+        )
+        self.chatgpt_cdp_port: int = int(os.getenv("CHATGPT_CDP_PORT", "9222"))
+        # Real Chrome for ChatGPT (not headless-shell). Falls back to system Chrome.
+        self.chatgpt_chrome_path: str | None = _opt("CHATGPT_CHROME_PATH")
+        # Attach to a real Chrome via CDP. When unset and auto-launch is on,
+        # defaults to http://127.0.0.1:<CHATGPT_CDP_PORT>.
+        cdp_raw = _opt("CHATGPT_CDP_URL")
+        if cdp_raw:
+            self.chatgpt_cdp_url: str | None = cdp_raw
+        elif self.chatgpt_auto_launch_chrome:
+            self.chatgpt_cdp_url = f"http://127.0.0.1:{self.chatgpt_cdp_port}"
+        else:
+            self.chatgpt_cdp_url = None
 
         # Qwen account / session (chat.qwen.ai)
         # Master switch — off by default; set QWEN_ENABLED=1 to use.

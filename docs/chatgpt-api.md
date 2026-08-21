@@ -19,9 +19,9 @@ python main.py
 
 或在 Cursor 使用 launch 配置：`Python: Flask`。
 
-启动前在项目根目录 `.env` 配置账号、代理与 Chrome 路径（见文末）。
+启动前在项目根目录 `.env` 配置代理等（见文末）。默认 `CHATGPT_AUTO_LAUNCH_CHROME=1`：服务会自动拉起真实 Chrome 并打开 chatgpt.com。
 
-服务启动时会打开**有界面**浏览器（默认 `CHATGPT_MANUAL_LOGIN=1`）：由你在窗口里手动完成登录/真人验证；成功后会话写入持久化目录。会话失效时，`/chat` 会再次打开窗口等你登录。不提供独立 login 接口。
+服务启动时会弹出 Chrome（默认 `CHATGPT_MANUAL_LOGIN=1`）：**首次**需在窗口里手动登录；成功后会话写入 `CHATGPT_USER_DATA_DIR`，下次通常免登。会话失效时 `/chat` 会再次等你登录。
 
 若设置 `CHATGPT_MANUAL_LOGIN=0` 且配置了账号密码，才会尝试自动填表登录（仍可能被 Cloudflare 拦截，不推荐）。
 
@@ -270,28 +270,33 @@ while True:
 
 默认 **手动登录**（`CHATGPT_MANUAL_LOGIN=1`）。
 
-**推荐：连接本机真实 Chrome（CDP）**，避免 Playwright 自带浏览器被 Cloudflare 永久卡在「请稍候」：
+**推荐（本地）：服务端自动拉起真实 Chrome（CDP）**，避免 Playwright 自带浏览器被 Cloudflare 卡在「请稍候」：
 
-1. 先关掉所有 Chrome，再启动调试 Chrome（系统 Chrome，不要用 `chrome-win64` 便携包）：
-
-   ```bat
-   "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%TEMP%\chrome-chatgpt-debug"
-   ```
-
-2. 在该窗口打开 chatgpt.com，**手动登录成功**（代理用你平时能上的方式）。
-
-3. `.env` 设置：
+1. `.env` 设置（默认已开启 auto-launch）：
 
    ```env
-   CHATGPT_CDP_URL=http://127.0.0.1:9222
+   CHATGPT_ENABLED=1
+   CHATGPT_AUTO_LAUNCH_CHROME=1
+   CHATGPT_CDP_PORT=9222
    CHATGPT_MANUAL_LOGIN=1
+   CHATGPT_PROXY=http://127.0.0.1:7890
    ```
 
-4. 再启动本服务；服务会附着到这个 Chrome，检测到聊天页即可用 `/api/chatgpt/chat`。
+2. 启动 `python main.py` — 服务会自动打开 Chrome 并访问 chatgpt.com。
 
-未配置 `CHATGPT_CDP_URL` 时，仍会用 Playwright 拉起有界面浏览器（容易被 Cloudflare 拦，不推荐作为登录手段）。
+3. **首次**在弹出的 Chrome 窗口里手动登录；登录态写入 `CHATGPT_USER_DATA_DIR`（默认 `data/chatgpt-browser`），下次启动无需再登。
 
-查看状态：`GET /api/chatgpt/status`（`cdp_url` / `manual_login` / `ready`）。
+4. `GET /api/chatgpt/status` 看到 `ready: true` 后即可 `/chat`。
+
+若需附着到**已手动打开**的 Chrome，设 `CHATGPT_AUTO_LAUNCH_CHROME=0` 并指定 `CHATGPT_CDP_URL=http://127.0.0.1:9222`。
+
+macOS 手动调试（可选）：
+
+```bash
+open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir="$PWD/backend/data/chatgpt-browser"
+```
+
+查看状态：`GET /api/chatgpt/status`（`cdp_url` / `auto_launch_chrome` / `manual_login` / `ready`）。
 
 ---
 
@@ -340,9 +345,12 @@ print(r2["answer"])
 | `HEADLESS` | `1` 无头 / `0` 有界面 |
 | `SQLITE_PATH` | 默认 `data/data.db` |
 | `CHATGPT_ENABLED` | 总开关，默认 `0`（关闭）；设为 `1` 才启用 GPT |
-| `CHATGPT_PROXY` | Playwright 代理，默认 `http://127.0.0.1:7890` |
+| `CHATGPT_PROXY` | Chrome / Playwright 代理，默认 `http://127.0.0.1:7890` |
+| `CHATGPT_AUTO_LAUNCH_CHROME` | `1`（默认）服务自动拉起真实 Chrome + CDP |
+| `CHATGPT_CDP_PORT` | auto-launch 调试端口，默认 `9222` |
+| `CHATGPT_CHROME_PATH` | ChatGPT 专用 Chrome 路径（不用 headless-shell） |
+| `CHATGPT_CDP_URL` | 附着已有 Chrome；设此项且 `AUTO_LAUNCH=0` 时不自动拉起 |
 | `CHATGPT_MANUAL_LOGIN` | `1`（默认）手动登录，不自动填密码 |
-| `CHATGPT_CDP_URL` | 连接本机 Chrome/Edge，如 `http://127.0.0.1:9222`（推荐） |
 | `CHATGPT_AUTO_LOGIN` | 仅当 `MANUAL_LOGIN=0` 时尝试密码自动填表，默认 `0` |
 | `CHATGPT_USERNAME` / `CHATGPT_PASSWORD` | 自动填表用（手动模式可不配） |
 | `CHATGPT_TIMEOUT_MS` | Playwright 页面操作超时，默认 120000 |

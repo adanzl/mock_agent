@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import re
+import subprocess
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
@@ -115,7 +119,10 @@ class ChatGPTClient:
         self.captcha_timeout_s = int(config.chatgpt_captcha_timeout_s)
         self.user_data_dir = Path(config.chatgpt_user_data_dir)
         self.cdp_url = (config.chatgpt_cdp_url or "").strip() or None
+        self.auto_launch_chrome = bool(config.chatgpt_auto_launch_chrome)
+        self.chatgpt_chrome_path = config.chatgpt_chrome_path
         self._attached_cdp = False
+        self._chrome_proc: subprocess.Popen[bytes] | None = None
         # Manual login requires a visible browser window.
         if self.manual_login and self.headless and not self.cdp_url:
             logger.warning(
@@ -179,6 +186,7 @@ class ChatGPTClient:
             "session_saved": db_mgr.has_browser_session(PROVIDER),
             "profile": str(self.user_data_dir),
             "cdp_url": self.cdp_url,
+            "auto_launch_chrome": self.auto_launch_chrome,
         }
 
     def _refresh_last_status(self) -> None:
@@ -197,6 +205,7 @@ class ChatGPTClient:
             "session_saved": db_mgr.has_browser_session(PROVIDER),
             "profile": str(self.user_data_dir),
             "cdp_url": self.cdp_url,
+            "auto_launch_chrome": self.auto_launch_chrome,
         }
 
     def start(self) -> None:
@@ -228,6 +237,11 @@ class ChatGPTClient:
         return self._submit(self._ensure_ready_impl)
 
     def _ensure_ready_impl(self) -> dict[str, Any]:
+        # CDP + manual login: keep Playwright detached until the user finishes
+        # clicking in Chrome (Playwright CDP attach breaks login buttons).
+        if self.cdp_url and self.manual_login:
+            self._ensure_cdp_chrome()
+            self._wait_manual_login_via_cdp()
         page = self._ensure_page_unlocked()
         self._wait_human_challenge(page)
         state = self._detect_shell_state(page)
@@ -260,6 +274,7 @@ class ChatGPTClient:
             "session_saved": db_mgr.has_browser_session(PROVIDER),
             "profile": str(self.user_data_dir),
             "cdp_url": self.cdp_url,
+            "auto_launch_chrome": self.auto_launch_chrome,
         }
 
     def _login_failed_message(self) -> str:
@@ -662,64 +677,284 @@ class ChatGPTClient:
                 f"Tried: {detail}"
             ) from exc
 
+    def _cdp_port(self) -> int:
+        if self.cdp_url:
+            parsed = urlparse(self.cdp_url)
+            if parsed.port:
+                return parsed.port
+        return int(config.chatgpt_cdp_port)
+
+    def _is_cdp_ready(self, cdp_url: str | None = None) -> bool:
+        url = (cdp_url or self.cdp_url or "").rstrip("/")
+        if not url:
+            return False
+        try:
+            with urllib.request.urlopen(f"{url}/json/version", timeout=2) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def _resolve_chrome_executable(self) -> str:
+        if self.chatgpt_chrome_path:
+            path = Path(self.chatgpt_chrome_path)
+            if path.is_file():
+                return str(path)
+            raise RuntimeError(f"CHATGPT_CHROME_PATH not found: {path}")
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+        for candidate in candidates:
+            if Path(candidate).is_file():
+                return candidate
+        if self.executable_path and "headless" not in Path(self.executable_path).name.lower():
+            return self.executable_path
+        raise RuntimeError(
+            "Google Chrome not found for ChatGPT; install Chrome or set CHATGPT_CHROME_PATH"
+        )
+
+    def _launch_chrome_for_cdp(self) -> None:
+        port = self._cdp_port()
+        chrome = self._resolve_chrome_executable()
+        self.user_data_dir.mkdir(parents=True, exist_ok=True)
+        args = [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={self.user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-notifications",
+            "--disable-blink-features=AutomationControlled",
+            CHAT_URL,
+        ]
+        proxy = (self.proxy or "").strip()
+        if proxy:
+            args.append(f"--proxy-server={proxy}")
+        logger.info(
+            "launching Chrome for ChatGPT cdp_port=%s profile=%s proxy=%s",
+            port,
+            self.user_data_dir,
+            proxy or "(none)",
+        )
+        self._chrome_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._browser_info = f"auto-launch:{chrome}"
+
+    def _ensure_cdp_chrome(self) -> None:
+        if self._is_cdp_ready():
+            return
+        if not self.auto_launch_chrome:
+            raise RuntimeError(
+                f"CDP Chrome not reachable at {self.cdp_url}; "
+                "start Chrome manually or set CHATGPT_AUTO_LAUNCH_CHROME=1"
+            )
+        self._launch_chrome_for_cdp()
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if self._is_cdp_ready():
+                logger.info("auto-launched Chrome CDP ready url=%s", self.cdp_url)
+                return
+            if self._chrome_proc is not None and self._chrome_proc.poll() is not None:
+                raise RuntimeError(
+                    "auto-launched Chrome exited early "
+                    f"code={self._chrome_proc.returncode}"
+                )
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"auto-launched Chrome did not open CDP on {self.cdp_url} within 45s"
+        )
+
+    def _cdp_tab_urls(self) -> list[str]:
+        base = (self.cdp_url or "").rstrip("/")
+        if not base:
+            return []
+        try:
+            with urllib.request.urlopen(f"{base}/json/list", timeout=3) as resp:
+                tabs = json.loads(resp.read())
+        except Exception:
+            return []
+        return [
+            str(item.get("url") or "")
+            for item in tabs
+            if str(item.get("type") or "") == "page"
+        ]
+
+    def _cdp_has_auth_flow(self, urls: list[str] | None = None) -> bool:
+        urls = urls if urls is not None else self._cdp_tab_urls()
+        for url in urls:
+            low = url.lower()
+            if "/auth/login" in low or "auth.openai.com" in low:
+                return True
+        return False
+
+    def _cdp_has_chat_session(self, urls: list[str] | None = None) -> bool:
+        urls = urls if urls is not None else self._cdp_tab_urls()
+        return any("/c/" in url and "chatgpt.com" in url.lower() for url in urls)
+
+    def _wait_manual_login_via_cdp(self) -> None:
+        """Wait for login without Playwright attached (CDP HTTP polling only)."""
+        urls = self._cdp_tab_urls()
+        if self._cdp_has_chat_session(urls):
+            return
+        logger.warning(
+            "ChatGPT manual login: 请在弹出的 Chrome 窗口完成登录"
+            "（Playwright 尚未连接，登录按钮可正常点击）。"
+            " timeout_s=%s profile=%s",
+            self.captcha_timeout_s,
+            self.user_data_dir,
+        )
+        deadline = time.time() + max(60, self.captcha_timeout_s)
+        last_log = 0.0
+        saw_auth = self._cdp_has_auth_flow(urls)
+        while time.time() < deadline:
+            urls = self._cdp_tab_urls()
+            if self._cdp_has_chat_session(urls):
+                logger.info("cdp manual login ok (conversation tab detected)")
+                return
+            if self._cdp_has_auth_flow(urls):
+                saw_auth = True
+            elif saw_auth:
+                try:
+                    self._start_unlocked()
+                    state = self._detect_shell_state(self._page)
+                    if state == "chat":
+                        logger.info(
+                            "cdp manual login ok state=chat url=%s", self._page.url
+                        )
+                        return
+                except Exception as exc:
+                    logger.warning("cdp login verify failed: %s", exc)
+                finally:
+                    if self._page is None or self._detect_shell_state(self._page) != "chat":
+                        self._stop_unlocked()
+                saw_auth = False
+            now = time.time()
+            if now - last_log > 20:
+                logger.info(
+                    "waiting for manual login (cdp detached)… remaining=%.0fs tabs=%s",
+                    deadline - now,
+                    urls,
+                )
+                last_log = now
+            time.sleep(2)
+        raise RuntimeError(self._login_failed_message())
+
+    def _pick_cdp_page(self, context: BrowserContext) -> Page | None:
+        """Prefer an existing logged-in chatgpt.com tab (local CDP workflow)."""
+        for page in context.pages:
+            url = (page.url or "").lower()
+            if "chatgpt.com" not in url:
+                continue
+            try:
+                if self._detect_shell_state(page) == "chat":
+                    logger.info("cdp: reuse logged-in tab url=%s", page.url)
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def _pick_cdp_page_any(self, context: BrowserContext) -> Page | None:
+        """Reuse any chatgpt.com tab (including login page)."""
+        for page in context.pages:
+            url = (page.url or "").lower()
+            if "chatgpt.com" in url:
+                logger.info("cdp: reuse chatgpt tab url=%s", page.url)
+                return page
+        return None
+
     def _connect_cdp(self, playwright: Playwright) -> tuple[Browser, BrowserContext, Page]:
         assert self.cdp_url
+        self._ensure_cdp_chrome()
         logger.info("connecting to Chrome via CDP %s", self.cdp_url)
         browser = playwright.chromium.connect_over_cdp(self.cdp_url)
-        if browser.contexts:
-            context = browser.contexts[0]
-        else:
-            context = browser.new_context()
-        page = context.new_page()
-        self._browser_info = f"cdp:{self.cdp_url}"
+        contexts = list(browser.contexts)
+        if not contexts:
+            contexts = [browser.new_context()]
+        page: Page | None = None
+        context = contexts[0]
+        for ctx in contexts:
+            page = self._pick_cdp_page(ctx)
+            if page is not None:
+                context = ctx
+                break
+        if page is None:
+            for ctx in contexts:
+                page = self._pick_cdp_page_any(ctx)
+                if page is not None:
+                    context = ctx
+                    break
+        if page is None:
+            if context.pages:
+                page = context.pages[0]
+                logger.info("cdp: use first tab url=%s", page.url)
+            else:
+                page = context.new_page()
+                logger.info("cdp: opened new tab")
+        self._browser_info = self._browser_info or f"cdp:{self.cdp_url}"
         self._attached_cdp = True
         return browser, context, page
 
     def _start_unlocked(self) -> None:
         if self._page is not None:
             return
-        self._playwright = sync_playwright().start()
-        if self.cdp_url:
-            # Real Chrome started by the user — Cloudflare is much less hostile.
-            self._browser, self._context, self._page = self._connect_cdp(self._playwright)
-        else:
-            self._browser = None
-            self._context = self._launch_persistent_context(self._playwright)
-            if self._context.pages:
-                self._page = self._context.pages[0]
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        try:
+            if self.cdp_url:
+                # Real Chrome started by the user — Cloudflare is much less hostile.
+                self._browser, self._context, self._page = self._connect_cdp(
+                    self._playwright
+                )
             else:
-                self._page = self._context.new_page()
-            self._attached_cdp = False
+                self._browser = None
+                self._context = self._launch_persistent_context(self._playwright)
+                if self._context.pages:
+                    self._page = self._context.pages[0]
+                else:
+                    self._page = self._context.new_page()
+                self._attached_cdp = False
 
-        self._page.set_default_timeout(self.timeout_ms)
-        if not self._attached_cdp:
-            self._page.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = window.chrome || { runtime: {} };
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) =>
-                    parameters.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery(parameters);
-                """
+            self._page.set_default_timeout(self.timeout_ms)
+            if not self._attached_cdp:
+                self._page.add_init_script(
+                    """
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    window.chrome = window.chrome || { runtime: {} };
+                    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5],
+                    });
+                    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
+                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) =>
+                        parameters.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : originalQuery(parameters);
+                    """
+                )
+            state = self._detect_shell_state(self._page)
+            if state != "chat":
+                self._page.goto(CHAT_URL, wait_until="domcontentloaded")
+                self._wait_human_challenge(self._page)
+                state = self._wait_shell_state(self._page, timeout_ms=60_000)
+            logger.debug(
+                "chat page ready state=%s url=%s cdp=%s",
+                state,
+                self._page.url,
+                bool(self.cdp_url),
             )
-        self._page.goto(CHAT_URL, wait_until="domcontentloaded")
-        self._wait_human_challenge(self._page)
-        state = self._wait_shell_state(self._page, timeout_ms=60_000)
-        logger.debug(
-            "chat page ready state=%s url=%s cdp=%s",
-            state,
-            self._page.url,
-            bool(self.cdp_url),
-        )
+        except Exception:
+            self._stop_unlocked()
+            raise
 
     def _stop_unlocked(self) -> None:
         # CDP attach: do NOT close the user's real Chrome — only disconnect.
@@ -771,6 +1006,18 @@ class ChatGPTClient:
             return False
 
         if self.manual_login:
+            if self.cdp_url:
+                self._stop_unlocked()
+                try:
+                    self._wait_manual_login_via_cdp()
+                    page = self._ensure_page_unlocked()
+                    if self._detect_shell_state(page) == "chat":
+                        self._save_storage_unlocked()
+                        logger.info("manual login ok, storage/profile saved url=%s", page.url)
+                        return True
+                    return False
+                except RuntimeError:
+                    return False
             return self._wait_manual_login(page)
 
         if not self.auto_login:
