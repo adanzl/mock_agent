@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
 from app.repositories.database import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -163,6 +165,16 @@ class ChatJobRunner:
                 exc,
             )
             return
+        except PlaywrightTimeoutError as exc:
+            msg = str(exc).split("\n", 1)[0].strip()
+            db_mgr.finish_chat_job_failure(job_id, error=msg, error_kind="runtime")
+            logger.warning(
+                "chat job failed job_id=%s provider=%s kind=runtime error=%s",
+                job_id,
+                provider,
+                msg,
+            )
+            return
         except TimeoutError as exc:
             db_mgr.finish_chat_job_failure(job_id, error=str(exc), error_kind="timeout")
             logger.error(
@@ -174,7 +186,7 @@ class ChatJobRunner:
             return
         except Exception as exc:
             db_mgr.finish_chat_job_failure(job_id, error=str(exc), error_kind="other")
-            logger.exception(
+            logger.error(
                 "chat job failed job_id=%s provider=%s kind=other error=%s",
                 job_id,
                 provider,

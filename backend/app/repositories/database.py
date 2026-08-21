@@ -242,6 +242,32 @@ class DbMgr:
             )
             conn.commit()
 
+    def replace_conversation_messages(
+        self,
+        conversation_id: str,
+        messages: list[tuple[str, str]],
+    ) -> None:
+        """Replace all messages for a conversation (used when syncing from web)."""
+        self.init()
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM conversation_message WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            if messages:
+                conn.executemany(
+                    """
+                    INSERT INTO conversation_message (conversation_id, role, content)
+                    VALUES (?, ?, ?)
+                    """,
+                    [(conversation_id, role, content) for role, content in messages],
+                )
+            conn.execute(
+                "UPDATE conversation SET updated_at = datetime('now') WHERE id = ?",
+                (conversation_id,),
+            )
+            conn.commit()
+
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         self.init()
         with self.connect() as conn:

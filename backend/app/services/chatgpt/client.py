@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 from app.config import config
 from app.repositories.database import db_mgr
@@ -44,13 +51,29 @@ MODE_ALIASES = {
 
 CHAT_READY_SELECTORS = [
     '#prompt-textarea[contenteditable="true"]',
+    '[data-testid="prompt-textarea"][contenteditable="true"]',
+    'div[contenteditable="true"][data-testid="prompt-textarea"]',
     "#prompt-textarea",
     '[data-testid="prompt-textarea"]',
-    'div[contenteditable="true"][data-testid="prompt-textarea"]',
-    'textarea[placeholder*="Message"]',
-    'textarea[placeholder*="Ask"]',
-    'textarea[placeholder*="有问题"]',
 ]
+COMPOSER_LOCATOR = (
+    '#prompt-textarea[contenteditable="true"], '
+    '[data-testid="prompt-textarea"][contenteditable="true"], '
+    'div[contenteditable="true"][data-testid="prompt-textarea"]'
+)
+# ChatGPT keeps a disabled fallback <textarea>; never treat it as the composer.
+COMPOSER_READY_JS = """() => {
+    const el = document.querySelector('#prompt-textarea[contenteditable="true"]')
+        || document.querySelector('[data-testid="prompt-textarea"][contenteditable="true"]')
+        || document.querySelector('div[contenteditable="true"][data-testid="prompt-textarea"]');
+    if (!el) return { ready: false, reason: 'missing' };
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 8 || rect.height < 8) return { ready: false, reason: 'hidden' };
+    if (el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled')) {
+        return { ready: false, reason: 'disabled' };
+    }
+    return { ready: true };
+}"""
 SIGN_IN_SELECTORS = [
     'button:has-text("Log in")',
     'button:has-text("登录")',
@@ -328,6 +351,20 @@ class ChatGPTClient:
                 )
                 if not will_retry:
                     raise
+            except PlaywrightTimeoutError as exc:
+                msg = str(exc).split("\n", 1)[0].strip()
+                last_exc = RuntimeError(f"composer not ready: {msg}")
+                will_retry = attempt < attempts
+                logger.warning(
+                    "ask composer attempt=%s/%s will_retry=%s conv=%s error=%s",
+                    attempt,
+                    attempts,
+                    will_retry,
+                    conversation_id,
+                    msg,
+                )
+                if not will_retry:
+                    raise last_exc from None
         assert last_exc is not None
         raise last_exc
 
@@ -582,6 +619,7 @@ class ChatGPTClient:
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state != "chat":
             raise RuntimeError(f"failed to open conversation {conv}, state={state}")
+        self._wait_composer_ready(page)
         opened = self._conversation_id_from_url(page.url)
         if opened and opened.lower() != conv.lower():
             logger.warning("opened conv mismatch want=%s got=%s", conv, opened)
@@ -1503,36 +1541,38 @@ class ChatGPTClient:
             time.sleep(0.25)
         return self._detect_shell_state(page)
 
+    def _wait_composer_ready(self, page: Page, timeout_s: float = 15) -> None:
+        deadline = time.time() + timeout_s
+        last_reason = "missing"
+        while time.time() < deadline:
+            try:
+                state = page.evaluate(COMPOSER_READY_JS)
+            except Exception:
+                state = {"ready": False, "reason": "evaluate_failed"}
+            if state.get("ready"):
+                return
+            last_reason = str(state.get("reason") or "missing")
+            time.sleep(0.25)
+        raise RuntimeError(f"composer not ready ({last_reason})")
+
     def _textarea(self, page: Page):
-        # Prefer the visible contenteditable composer (Chinese UI).
-        preferred = page.locator('#prompt-textarea[contenteditable="true"]')
+        self._wait_composer_ready(page)
+        loc = page.locator(COMPOSER_LOCATOR)
         try:
-            if preferred.count() > 0 and preferred.first.is_visible():
-                return preferred.first
+            if loc.count() > 0 and loc.first.is_visible():
+                return loc.first
         except Exception:
             pass
-        for selector in CHAT_READY_SELECTORS:
-            loc = page.locator(selector)
-            try:
-                count = min(loc.count(), 6)
-                for i in range(count):
-                    node = loc.nth(i)
-                    if node.is_visible():
-                        return node
-            except Exception:
-                continue
-        raise RuntimeError("message textarea not found")
+        raise RuntimeError("message composer not found")
 
     def _enter_message(self, page: Page, message: str) -> None:
-        box = self._textarea(page)
-        box.click(timeout=10_000)
-        time.sleep(0.2)
+        self._wait_composer_ready(page)
         # ProseMirror / contenteditable: fill() often does not update React state.
         inserted = page.evaluate(
             """(msg) => {
                 const el = document.querySelector('#prompt-textarea[contenteditable="true"]')
-                    || document.querySelector('#prompt-textarea')
-                    || document.querySelector('[data-testid="prompt-textarea"]');
+                    || document.querySelector('[data-testid="prompt-textarea"][contenteditable="true"]')
+                    || document.querySelector('div[contenteditable="true"][data-testid="prompt-textarea"]');
                 if (!el) return false;
                 el.focus();
                 try {
@@ -1547,6 +1587,14 @@ class ChatGPTClient:
             message,
         )
         if not inserted:
+            box = self._textarea(page)
+            try:
+                box.click(timeout=3_000)
+            except PlaywrightTimeoutError as exc:
+                raise RuntimeError(
+                    f"composer not clickable: {str(exc).split(chr(10), 1)[0]}"
+                ) from None
+            time.sleep(0.2)
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
             page.keyboard.type(message, delay=8)
@@ -1555,7 +1603,9 @@ class ChatGPTClient:
         while time.time() < deadline:
             has_text = page.evaluate(
                 """() => {
-                    const el = document.querySelector('#prompt-textarea');
+                    const el = document.querySelector('#prompt-textarea[contenteditable="true"]')
+                        || document.querySelector('[data-testid="prompt-textarea"][contenteditable="true"]')
+                        || document.querySelector('div[contenteditable="true"][data-testid="prompt-textarea"]');
                     return !!(el && (el.innerText || el.textContent || '').trim());
                 }"""
             )

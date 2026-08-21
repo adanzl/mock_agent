@@ -159,7 +159,7 @@ def chat():
         logger.error("chat timeout: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 504
     except Exception as exc:
-        logger.exception("chat failed: %s", exc)
+        logger.error("chat failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 

@@ -62,5 +62,8 @@ class DeepSeekMgr:
     ) -> list[dict[str, Any]]:
         return db_mgr.list_conversation_messages(conversation_id, limit=limit)
 
+    def sync_conversation(self, conversation_id: str) -> dict[str, Any]:
+        return self._get_client().sync_conversation(conversation_id)
+
 
 deepseek_mgr = DeepSeekMgr()

@@ -71,6 +71,37 @@ SIGN_IN_SELECTORS = [
     "button:has-text('登录')",
 ]
 ASSISTANT_SELECTOR = "div.ds-message:has(.ds-markdown)"
+COLLECT_MESSAGES_JS = """() => {
+    const nodes = Array.from(document.querySelectorAll('.ds-message'));
+    return nodes.map((node) => {
+        const isAssistant = !!node.querySelector('.ds-markdown');
+        const content = (node.innerText || '').trim();
+        if (!content) return null;
+        return {
+            role: isAssistant ? 'assistant' : 'user',
+            content,
+        };
+    }).filter(Boolean);
+}"""
+SCROLL_MESSAGE_CONTAINER_JS = """(delta) => {
+    let best = null;
+    let bestOverflow = 0;
+    for (const el of document.querySelectorAll('div')) {
+        const overflow = el.scrollHeight - el.clientHeight;
+        if (overflow > bestOverflow) {
+            bestOverflow = overflow;
+            best = el;
+        }
+    }
+    if (!best) return { ok: false, at_bottom: true };
+    if (delta === 0) {
+        best.scrollTop = 0;
+    } else {
+        best.scrollTop += delta;
+    }
+    const atBottom = best.scrollTop + best.clientHeight >= best.scrollHeight - 4;
+    return { ok: true, at_bottom: atBottom };
+}"""
 COMPOSER_BUTTON_SELECTORS = [
     "div.ds-button.ds-button--circle",
     "div.ds-icon-button",
@@ -463,6 +494,101 @@ class DeepSeekClient:
                     raise
         assert last_exc is not None
         raise last_exc
+
+    def sync_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Pull conversation history from chat.deepseek.com into local SQLite."""
+        return self._submit(lambda: self._sync_conversation_impl(conversation_id))
+
+    def _sync_conversation_impl(self, conversation_id: str) -> dict[str, Any]:
+        conv = (conversation_id or "").strip()
+        match = CONVERSATION_ID_RE.search(conv)
+        if match:
+            conv = match.group(1)
+        elif not re.fullmatch(
+            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+            conv,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError(f"invalid conversation_id: {conversation_id}")
+
+        t0 = time.perf_counter()
+        slot = self._current_slot()
+        page = self._ensure_page_unlocked()
+        state = self._detect_shell_state(page)
+        logger.info(
+            "sync conversation start worker=%s state=%s conv=%s",
+            slot.worker_id,
+            state,
+            conv,
+        )
+        if state == "auth":
+            if not self._ensure_logged_in(page):
+                raise RuntimeError(
+                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
+                )
+            state = self._detect_shell_state(page)
+        if state != "chat":
+            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            state = self._wait_shell_state(page, timeout_ms=60_000)
+            if state == "auth" and not self._ensure_logged_in(page):
+                raise RuntimeError(
+                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
+                )
+            state = self._detect_shell_state(page)
+            if state != "chat":
+                raise RuntimeError(f"chat UI not ready, state={state}")
+
+        self._open_conversation(page, conv)
+        messages = self._collect_conversation_messages(page)
+        if not messages:
+            raise RuntimeError(f"no messages found for conversation {conv}")
+
+        conv_id = self._conversation_id_from_url(page.url) or conv
+        title = (page.title() or "").replace(" - DeepSeek", "").strip() or None
+        mode = self._detect_current_mode(page) or "instant"
+        deep_thinking = bool(
+            page.evaluate(
+                """() => {
+                    const btn = document.querySelectorAll('.ds-toggle-button')[0];
+                    return !!(btn && btn.classList.contains('ds-toggle-button--selected'));
+                }"""
+            )
+        )
+        url = page.url
+        db_mgr.upsert_conversation(
+            conversation_id=conv_id,
+            provider=PROVIDER,
+            title=title,
+            mode=mode,
+            deep_thinking=deep_thinking,
+            search=False,
+            url=url,
+        )
+        db_mgr.replace_conversation_messages(
+            conv_id,
+            [(str(m["role"]), str(m["content"])) for m in messages],
+        )
+        self._save_storage_unlocked()
+
+        logger.info(
+            "sync conversation done worker=%s conv=%s messages=%s elapsed=%.1fs",
+            slot.worker_id,
+            conv_id,
+            len(messages),
+            time.perf_counter() - t0,
+        )
+        return {
+            "ok": True,
+            "conversation_id": conv_id,
+            "title": title,
+            "mode": mode,
+            "deep_thinking": deep_thinking,
+            "search": False,
+            "url": url,
+            "message_count": len(messages),
+            "synced": True,
+            "worker_id": slot.worker_id,
+        }
 
     def _resolve_chat_timeout_s(
         self,
@@ -1062,6 +1188,61 @@ class DeepSeekClient:
                 continue
         page.goto(CHAT_URL, wait_until="domcontentloaded")
         self._wait_shell_state(page, timeout_ms=30_000)
+
+    def _collect_conversation_messages(self, page: Page) -> list[dict[str, str]]:
+        """Scroll through the chat thread and collect all visible messages."""
+        page.evaluate(SCROLL_MESSAGE_CONTAINER_JS, 0)
+        time.sleep(0.8)
+
+        ordered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        stale_rounds = 0
+
+        for _ in range(200):
+            batch = page.evaluate(COLLECT_MESSAGES_JS) or []
+            added = 0
+            for item in batch:
+                role = str(item.get("role") or "").strip()
+                content = str(item.get("content") or "").strip()
+                if role not in {"user", "assistant"} or not content:
+                    continue
+                key = (role, content)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(key)
+                added += 1
+
+            scroll = page.evaluate(
+                """() => {
+                    let best = null;
+                    let bestOverflow = 0;
+                    for (const el of document.querySelectorAll('div')) {
+                        const overflow = el.scrollHeight - el.clientHeight;
+                        if (overflow > bestOverflow) {
+                            bestOverflow = overflow;
+                            best = el;
+                        }
+                    }
+                    if (!best) return { at_bottom: true };
+                    const atBottom = best.scrollTop + best.clientHeight >= best.scrollHeight - 4;
+                    if (!atBottom) {
+                        best.scrollTop += Math.max(200, best.clientHeight * 0.85);
+                    }
+                    return { at_bottom: atBottom };
+                }"""
+            ) or {"at_bottom": True}
+
+            if added == 0:
+                stale_rounds += 1
+            else:
+                stale_rounds = 0
+
+            if scroll.get("at_bottom") and stale_rounds >= 2:
+                break
+            time.sleep(0.35)
+
+        return [{"role": role, "content": content} for role, content in ordered]
 
     def _last_assistant_text(self, page: Page) -> str:
         loc = page.locator(ASSISTANT_SELECTOR)

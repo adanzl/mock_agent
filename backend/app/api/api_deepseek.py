@@ -90,14 +90,49 @@ def conversations():
 def conversation_detail(conversation_id: str):
     if not config.deepseek_enabled:
         return _disabled_response()
+    sync = request.args.get("sync", "").strip().lower() in {"1", "true", "yes", "on"}
     try:
+        if sync or deepseek_mgr.get_conversation(conversation_id) is None:
+            deepseek_mgr.sync_conversation(conversation_id)
         item = deepseek_mgr.get_conversation(conversation_id)
         if item is None:
             return jsonify({"ok": False, "error": "conversation not found"}), 404
         messages = deepseek_mgr.list_conversation_messages(conversation_id)
         return jsonify({"ok": True, "conversation": item, "messages": messages})
+    except ValueError as exc:
+        logger.warning("conversation detail bad request: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except RuntimeError as exc:
+        logger.warning("conversation sync/runtime: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 401
     except Exception as exc:
-        logger.exception("conversation detail failed: %s", exc)
+        logger.error("conversation detail failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@bp.post("/conversations/<conversation_id>/sync")
+def conversation_sync(conversation_id: str):
+    if not config.deepseek_enabled:
+        return _disabled_response()
+    try:
+        result = deepseek_mgr.sync_conversation(conversation_id)
+        item = deepseek_mgr.get_conversation(conversation_id)
+        messages = deepseek_mgr.list_conversation_messages(conversation_id)
+        return jsonify(
+            {
+                **result,
+                "conversation": item,
+                "messages": messages,
+            }
+        )
+    except ValueError as exc:
+        logger.warning("conversation sync bad request: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except RuntimeError as exc:
+        logger.warning("conversation sync/runtime: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 401
+    except Exception as exc:
+        logger.error("conversation sync failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 

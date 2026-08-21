@@ -72,7 +72,8 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | POST | `/api/deepseek/chat/async` | 异步提问（立即返回 `job_id`） |
 | GET | `/api/deepseek/chat/jobs/<id>` | 查询异步任务状态 / 结果 |
 | GET | `/api/deepseek/conversations` | 本地会话列表 |
-| GET | `/api/deepseek/conversations/<id>` | 会话详情 + 消息历史 |
+| GET | `/api/deepseek/conversations/<id>` | 会话详情 + 消息历史（本地无记录时可加 `?sync=1` 从网页拉取） |
+| POST | `/api/deepseek/conversations/<id>/sync` | 从 chat.deepseek.com 拉取账号内已有会话并写入本地库 |
 
 ---
 
@@ -257,6 +258,15 @@ while True:
 
 `GET /api/deepseek/conversations/<conversation_id>`
 
+本地 SQLite 里有记录时直接返回。若会话是你在 chat.deepseek.com 上手动开的、不是 mock-agent 创建的，本地可能没有；此时：
+
+- 加 `?sync=1` 自动从网页拉取后再返回
+- 或先调下面的 `POST .../sync`
+
+```bash
+curl -s "http://127.0.0.1:8765/api/deepseek/conversations/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx?sync=1"
+```
+
 ```json
 {
   "ok": true,
@@ -267,6 +277,18 @@ while True:
   ]
 }
 ```
+
+### 从网页同步已有会话
+
+`POST /api/deepseek/conversations/<conversation_id>/sync`
+
+用 `.env` 账号登录态打开 DeepSeek 网页上的该会话，滚动加载全部消息后写入本地库（**覆盖**本地同 id 的消息）。
+
+```bash
+curl -s -X POST "http://127.0.0.1:8765/api/deepseek/conversations/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/sync"
+```
+
+成功响应含 `conversation`、`messages`、`message_count`、`synced: true`。之后可带该 `conversation_id` 续聊。
 
 本地库路径由 `SQLITE_PATH` 决定，默认 `backend/data/data.db`。
 
