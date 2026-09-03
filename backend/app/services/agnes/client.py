@@ -136,6 +136,7 @@ class AgnesClient:
         self.timeout_ms = int(
             config.agnes_timeout_ms if timeout_ms is None else timeout_ms
         )
+        self.proxy = config.agnes_proxy
         self.browser_channel = config.browser_channel
         self.executable_path = config.chrome_path
         self.username = config.agnes_username
@@ -164,7 +165,7 @@ class AgnesClient:
             )
             thread.start()
             self._threads.append(thread)
-        logger.info("agnes: pool workers=%s", self.worker_count)
+        logger.info("agnes: pool workers=%s proxy=%s", self.worker_count, self.proxy)
 
     def _worker_loop(self, slot: _WorkerSlot) -> None:
         while True:
@@ -287,6 +288,7 @@ class AgnesClient:
             "url": "",
             "headless": self.headless,
             "browser": self._browser_info or self.browser_channel,
+            "proxy": self.proxy,
             "sqlite_path": str(db_mgr.path()),
             "session_saved": db_mgr.has_browser_session(PROVIDER),
             "workers": self.worker_count,
@@ -337,6 +339,7 @@ class AgnesClient:
                 "url": url,
                 "headless": self.headless,
                 "browser": self._browser_info or self.browser_channel,
+                "proxy": self.proxy,
                 "sqlite_path": str(db_mgr.path()),
                 "session_saved": db_mgr.has_browser_session(PROVIDER),
                 "workers": self.worker_count,
@@ -351,10 +354,11 @@ class AgnesClient:
 
     def _start_impl(self) -> None:
         logger.debug(
-            "browser start requested worker=%s headless=%s channel=%s",
+            "browser start requested worker=%s headless=%s channel=%s proxy=%s",
             self._current_slot().worker_id,
             self.headless,
             self.browser_channel,
+            self.proxy,
         )
         self._start_unlocked()
 
@@ -383,6 +387,7 @@ class AgnesClient:
         merged = dict(results[0] if results else {"ok": True, "ready": False})
         merged["workers"] = self.worker_count
         merged["ready_workers"] = sum(1 for r in results if r and r.get("ready"))
+        merged["proxy"] = self.proxy
         if self._last_status:
             merged.update(
                 {
@@ -727,9 +732,16 @@ class AgnesClient:
         if opened and opened.lower() != conv.lower():
             logger.warning("opened conv mismatch want=%s got=%s", conv, opened)
 
+    def _proxy_kwargs(self) -> dict[str, Any]:
+        proxy = (self.proxy or "").strip()
+        if not proxy:
+            return {}
+        return {"proxy": {"server": proxy}}
+
     def _launch_browser(self, playwright: Playwright) -> Browser:
         launch_args = [
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
@@ -740,6 +752,7 @@ class AgnesClient:
             "headless": self.headless,
             "args": launch_args,
             "ignore_default_args": ["--enable-automation"],
+            **self._proxy_kwargs(),
         }
         errors: list[str] = []
 

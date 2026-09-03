@@ -1,9 +1,11 @@
 # Agnes 网页模拟 API
 
-通过无头浏览器操作 [app.agnes-ai.com](https://app.agnes-ai.com/)，对外提供 HTTP 接口。
+通过无头浏览器操作 [app.agnes-ai.com](https://app.agnes-ai.com/)，经本地 HTTP 代理访问，对外提供 HTTP 接口。
 
 默认地址：`http://127.0.0.1:8765`  
 前缀：`/api/agnes`
+
+浏览器流量默认走 `http://127.0.0.1:7890`（可用 `AGNES_PROXY` 覆盖）。DeepSeek / Qwen 模块不受影响。
 
 **默认关闭**：需在 `.env` 设置 `AGNES_ENABLED=1` 后才会启动 / 接受 chat；未开启时 `/api/agnes/chat` 返回 503。
 
@@ -228,6 +230,7 @@ while True:
   "url": "https://app.agnes-ai.com/...",
   "headless": true,
   "browser": "channel:chrome",
+  "proxy": "http://127.0.0.1:7890",
   "session_saved": true,
   "workers": 2,
   "busy": 0,
@@ -267,6 +270,7 @@ while True:
 | 变量 | 说明 |
 | --- | --- |
 | `AGNES_ENABLED` | 总开关，默认 `0`（关闭）；设为 `1` 开启 |
+| `AGNES_PROXY` | Playwright 代理，默认 `http://127.0.0.1:7890` |
 | `AGNES_TIMEOUT_MS` | Playwright UI 操作超时，默认 `120000` |
 | `AGNES_CHAT_TIMEOUT_S` | 普通回复等待秒数，默认 `300` |
 | `AGNES_THINK_TIMEOUT_S` | `deep_thinking=true` 时等待秒数，默认 `600`（开关本身为 no-op） |

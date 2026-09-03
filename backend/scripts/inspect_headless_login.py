@@ -31,6 +31,7 @@ def main() -> None:
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-infobars",

@@ -149,9 +149,13 @@ class Config:
         self.qwen_password: str | None = _opt("QWEN_PASSWORD")
         self.qwen_auto_login: bool = _bool("QWEN_AUTO_LOGIN", True)
 
-        # Agnes account / session (app.agnes-ai.com)
+        # Agnes account / session (app.agnes-ai.com, via local proxy)
         # Master switch — off by default; set AGNES_ENABLED=1 to use.
         self.agnes_enabled: bool = _bool("AGNES_ENABLED", False)
+        self.agnes_proxy: str = (
+            os.getenv("AGNES_PROXY", "http://127.0.0.1:7890").strip()
+            or "http://127.0.0.1:7890"
+        )
         self.agnes_timeout_ms: int = int(os.getenv("AGNES_TIMEOUT_MS", "120000"))
         self.agnes_chat_timeout_s: int = int(os.getenv("AGNES_CHAT_TIMEOUT_S", "300"))
         self.agnes_think_timeout_s: int = int(os.getenv("AGNES_THINK_TIMEOUT_S", "600"))

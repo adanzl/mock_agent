@@ -766,6 +766,7 @@ class ChatGPTClient:
             "--no-default-browser-check",
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=AutomationControlled",
             CHAT_URL,
         ]
         proxy = (self.proxy or "").strip()

@@ -146,11 +146,12 @@ def _bootstrap_agnes() -> None:
             workers = result.get("workers")
             ready_workers = result.get("ready_workers")
             log.info(
-                "agnes: ready state=%s workers=%s/%s session_saved=%s",
+                "agnes: ready state=%s workers=%s/%s session_saved=%s proxy=%s",
                 result.get("state"),
                 ready_workers if ready_workers is not None else "?",
                 workers if workers is not None else "?",
                 result.get("session_saved"),
+                result.get("proxy"),
             )
             return
         except Exception as exc:
