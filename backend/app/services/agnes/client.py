@@ -740,8 +740,6 @@ class AgnesClient:
 
     def _launch_browser(self, playwright: Playwright) -> Browser:
         launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",

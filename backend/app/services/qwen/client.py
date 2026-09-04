@@ -278,8 +278,31 @@ class QwenClient:
             raise result
         return result
 
-    def _submit_all(self, func: Callable[[], Any]) -> list[Any]:
+    def _submit_all(
+        self,
+        func: Callable[[], Any],
+        *,
+        serial: bool = False,
+    ) -> list[Any]:
         """Run func once on every worker (start / ensure_ready / stop prep)."""
+        if serial:
+            results: list[Any] = []
+            errors: list[BaseException] = []
+            for slot in self._slots:
+                try:
+                    results.append(self._submit_to(slot, func))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+            if errors and not results:
+                raise errors[0]
+            if errors:
+                logger.warning(
+                    "worker pool partial failure ok=%s err=%s",
+                    len(results),
+                    "; ".join(str(e) for e in errors),
+                )
+            return results
+
         dones: list["queue.Queue[tuple]"] = []
         with self._pick_lock:
             for slot in self._slots:
@@ -372,7 +395,7 @@ class QwenClient:
             }
 
     def start(self) -> None:
-        self._submit_all(self._start_impl)
+        self._submit_all(self._start_impl, serial=True)
 
     def _start_impl(self) -> None:
         logger.debug(
@@ -403,7 +426,7 @@ class QwenClient:
 
     def ensure_ready(self) -> dict[str, Any]:
         """Start every worker browser and auto-login from .env if needed."""
-        results = self._submit_all(self._ensure_ready_impl)
+        results = self._submit_all(self._ensure_ready_impl, serial=True)
         self._publish_status()
         merged = dict(results[0] if results else {"ok": True, "ready": False})
         merged["workers"] = self.worker_count
@@ -435,7 +458,7 @@ class QwenClient:
             if not ok or state != "chat":
                 raise RuntimeError(self._login_failed_message())
         elif state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -572,7 +595,7 @@ class QwenClient:
             state = self._detect_shell_state(page)
 
         if state != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -885,7 +908,7 @@ class QwenClient:
             logger.info("already on conversation id=%s", conv)
             return
         logger.info("open conversation id=%s url=%s", conv, target)
-        page.goto(str(target), wait_until="domcontentloaded")
+        self._goto(page, str(target))
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state != "chat":
             raise RuntimeError(f"failed to open conversation {conv}, state={state}")
@@ -895,13 +918,13 @@ class QwenClient:
 
     def _launch_browser(self, playwright: Playwright) -> Browser:
         launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
             "--disable-notifications",
             "--lang=zh-CN",
+            "--disable-http2",
+            "--disable-quic",
         ]
         common: dict[str, Any] = {
             "headless": self.headless,
@@ -989,7 +1012,7 @@ class QwenClient:
                     : originalQuery(parameters);
             """
         )
-        slot.page.goto(CHAT_URL, wait_until="domcontentloaded")
+        self._goto(slot.page, CHAT_URL)
         state = self._wait_shell_state(slot.page, timeout_ms=60_000)
         logger.debug(
             "chat page ready worker=%s state=%s url=%s",
@@ -997,6 +1020,47 @@ class QwenClient:
             state,
             slot.page.url,
         )
+
+    def _goto(
+        self,
+        page: Page,
+        url: str,
+        *,
+        wait_until: str = "domcontentloaded",
+        attempts: int = 3,
+        timeout_ms: int | None = None,
+    ) -> None:
+        """Navigate with retries for flaky empty responses from chat.qwen.ai."""
+        del wait_until  # commit first; empty responses hang less than full DOM.
+        timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        soft_timeout = min(20_000, max(8_000, timeout))
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                page.goto(url, wait_until="commit", timeout=soft_timeout)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=soft_timeout)
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "goto stuck attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    attempts,
+                    url,
+                    exc,
+                )
+                if attempt >= attempts:
+                    break
+                try:
+                    page.goto("about:blank", wait_until="commit", timeout=5_000)
+                except Exception:
+                    pass
+                time.sleep(2.0 * attempt)
+        assert last_exc is not None
+        raise last_exc
 
     def _stop_unlocked(self) -> None:
         slot = self._current_slot()
@@ -1089,7 +1153,7 @@ class QwenClient:
             self._current_slot().worker_id,
         )
         if "/auth" not in (page.url or "").lower():
-            page.goto(AUTH_URL, wait_until="domcontentloaded")
+            self._goto(page, AUTH_URL)
         page.wait_for_load_state("domcontentloaded")
         time.sleep(0.8)
 
@@ -1131,7 +1195,7 @@ class QwenClient:
             raise RuntimeError("login submit did not set token cookie")
 
         if self._detect_shell_state(page) != "chat":
-            page.goto(CHAT_URL, wait_until="domcontentloaded")
+            self._goto(page, CHAT_URL)
             if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
                 raise RuntimeError("login submit did not reach chat UI")
 
@@ -1380,7 +1444,7 @@ class QwenClient:
                     return
             except Exception:
                 continue
-        page.goto(f"{CHAT_URL.rstrip('/')}/c/new-chat", wait_until="domcontentloaded")
+        self._goto(page, f"{CHAT_URL.rstrip('/')}/c/new-chat")
         self._wait_shell_state(page, timeout_ms=30_000)
 
     def _assistant_locator(self, page: Page):

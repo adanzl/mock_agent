@@ -30,8 +30,6 @@ def main() -> None:
             executable_path=config.chrome_path,
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-infobars",

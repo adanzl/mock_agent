@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -632,7 +634,6 @@ class ChatGPTClient:
 
     def _launch_args(self) -> list[str]:
         return [
-            "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
@@ -732,6 +733,75 @@ class ChatGPTClient:
         except Exception:
             return False
 
+    def _pids_listening(self, port: int) -> list[int]:
+        try:
+            out = subprocess.check_output(
+                ["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return []
+        pids: list[int] = []
+        for line in out.splitlines():
+            try:
+                pids.append(int(line.strip()))
+            except ValueError:
+                continue
+        return pids
+
+    def _kill_cdp_chrome(self) -> None:
+        """Stop auto-launched / orphaned CDP Chrome on our debug port."""
+        if self._chrome_proc is not None:
+            try:
+                os.killpg(self._chrome_proc.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    self._chrome_proc.terminate()
+                except Exception:
+                    pass
+            self._chrome_proc = None
+
+        port = self._cdp_port()
+        for pid in self._pids_listening(port):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                logger.info("killed CDP Chrome pid=%s port=%s", pid, port)
+            except Exception as exc:
+                logger.warning("kill CDP Chrome pid=%s failed: %s", pid, exc)
+
+        deadline = time.time() + 15
+        while time.time() < deadline and self._is_cdp_ready():
+            time.sleep(0.25)
+        if self._is_cdp_ready():
+            for pid in self._pids_listening(port):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+    def _restart_cdp_chrome(self) -> None:
+        """Relaunch CDP Chrome after a failed Playwright attach."""
+        logger.warning("restarting CDP Chrome after connect failure")
+        self._kill_cdp_chrome()
+        time.sleep(0.5)
+        self._launch_chrome_for_cdp()
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if self._is_cdp_ready():
+                logger.info("restarted Chrome CDP ready url=%s", self.cdp_url)
+                return
+            if self._chrome_proc is not None and self._chrome_proc.poll() is not None:
+                raise RuntimeError(
+                    "restarted Chrome exited early "
+                    f"code={self._chrome_proc.returncode}"
+                )
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"restarted Chrome did not open CDP on {self.cdp_url} within 45s"
+        )
+
     def _resolve_chrome_executable(self) -> str:
         if self.chatgpt_chrome_path:
             path = Path(self.chatgpt_chrome_path)
@@ -765,8 +835,6 @@ class ChatGPTClient:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-notifications",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=AutomationControlled",
             CHAT_URL,
         ]
         proxy = (self.proxy or "").strip()
@@ -911,8 +979,39 @@ class ChatGPTClient:
     def _connect_cdp(self, playwright: Playwright) -> tuple[Browser, BrowserContext, Page]:
         assert self.cdp_url
         self._ensure_cdp_chrome()
-        logger.info("connecting to Chrome via CDP %s", self.cdp_url)
-        browser = playwright.chromium.connect_over_cdp(self.cdp_url)
+        last_exc: Exception | None = None
+        browser: Browser | None = None
+        attempts = 2 if self.auto_launch_chrome else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                logger.info(
+                    "connecting to Chrome via CDP %s attempt=%s/%s",
+                    self.cdp_url,
+                    attempt,
+                    attempts,
+                )
+                # no_defaults skips Browser.setDownloadBehavior, which newer Chrome
+                # rejects after an unclean previous CDP disconnect.
+                browser = playwright.chromium.connect_over_cdp(
+                    self.cdp_url,
+                    no_defaults=True,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "cdp connect failed attempt=%s/%s error=%s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt >= attempts or not self.auto_launch_chrome:
+                    break
+                self._restart_cdp_chrome()
+        if browser is None:
+            assert last_exc is not None
+            raise last_exc
+
         contexts = list(browser.contexts)
         if not contexts:
             contexts = [browser.new_context()]
