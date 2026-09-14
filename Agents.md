@@ -5,8 +5,8 @@
 主机名：
 
 - 局域网 主机: mini  
-- 广域网 主机：vip.sy.frp.one:57904
-- 广域网 主机：57c42474b0ea.ofalias.net:58186
+- 广域网 主机：leo-mini.fucku.top:57904
+- 广域网 主机：cn-hk-bgp-4.ofalias.net:27358
 用户名 leo
 密码 见.env 里的 SSH_PASSWORD
 优先级从上到下
