@@ -32,6 +32,8 @@ CONVERSATION_ID_RE = re.compile(r"/c/([^/?#]+)", re.IGNORECASE)
 RESERVED_CONV_IDS = {"new-chat", "guest", "new"}
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# Seconds to wait for proof that a sent message actually started a reply.
+SEND_CONFIRM_S = 20
 DATA_URL_RE = re.compile(
     r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$",
     re.IGNORECASE | re.DOTALL,
@@ -58,18 +60,63 @@ class _WorkerSlot:
     last_status: dict[str, Any] | None = None
 
 
-# mode=auto keeps current model; other values try to match model selector text.
+# Live model list from GET https://chat.qwen.ai/api/models:
+#   qwen3.7-plus (Qwen3.7-Plus), qwen3.8-max (Qwen3.8-Max),
+#   qwen3.8-omni-flash (Qwen3.8-Omni-Flash)
+# Legacy names are kept mapped onto live models so old callers still work.
+MODEL_ALIASES = {
+    "plus": "Qwen3.7-Plus",
+    "qwen3.7-plus": "Qwen3.7-Plus",
+    "max": "Qwen3.8-Max",
+    "qwen3.8-max": "Qwen3.8-Max",
+    "omni": "Qwen3.8-Omni-Flash",
+    "flash": "Qwen3.8-Omni-Flash",
+    "qwen3.8-omni-flash": "Qwen3.8-Omni-Flash",
+    "qwen3.5-plus": "Qwen3.7-Plus",
+    "qwen3.6-plus": "Qwen3.7-Plus",
+    "qwen3.5-flash": "Qwen3.8-Omni-Flash",
+    "qwen3-max": "Qwen3.8-Max",
+}
+# Qwen thinking selector options are 自动 / 思考 / 快速 only; there is no
+# "expert"/"instant" mode on this frontend, so those names drive thinking.
+THINKING_ALIASES = {
+    "fast": "fast",
+    "instant": "fast",
+    "quick": "fast",
+    "快速": "fast",
+    "快速模式": "fast",
+    "think": "think",
+    "thinking": "think",
+    "expert": "think",
+    "专家": "think",
+    "专家模式": "think",
+    "思考": "think",
+}
 MODE_ALIASES = {
     "auto": "auto",
     "default": "auto",
-    "plus": "Qwen3.5-Plus",
-    "qwen3.5-plus": "Qwen3.5-Plus",
-    "flash": "Qwen3.5-Flash",
-    "qwen3.5-flash": "Qwen3.5-Flash",
-    "max": "Qwen3-Max",
-    "qwen3-max": "Qwen3-Max",
-    "qwen3.6-plus": "Qwen3.6-Plus",
+    **MODEL_ALIASES,
+    **THINKING_ALIASES,
 }
+THINKING_LABELS = {"fast": "快速", "think": "思考"}
+
+# Qwen model picker (verified 2026-10): trigger div.wms-trigger,
+# options div.wms-list__item, current label div.wms-trigger__text.
+MODEL_TRIGGER_SELECTORS = [
+    ".wms-trigger",
+    "[class*='wms-trigger']",
+    "div[class*='model-selector']",
+]
+# Qwen thinking picker: div.qwen-thinking-selector + dropdown items.
+THINKING_TRIGGER_SELECTORS = [
+    "div.qwen-thinking-selector",
+    "[class*='qwen-thinking-selector']",
+]
+THINKING_OPTION_SELECTORS = [
+    "span.qwen-chat-v2-dropdown-menu-item-content",
+    "span.qwen-chat-v2-dropdown-menu-item-label",
+    "div.qwen-chat-v2-dropdown-menu-item",
+]
 
 CHAT_READY_SELECTORS = [
     "textarea.message-input-textarea",
@@ -78,21 +125,67 @@ CHAT_READY_SELECTORS = [
     "textarea[placeholder*='Message']",
     "textarea",
 ]
+# The SPA ships a full-screen #splash-screen overlay (z-index 9999) that is
+# not removed until hydration finishes; the textarea is already "visible"
+# underneath it, which used to be mistaken for a ready chat shell.
+SPLASH_SELECTORS = ["#splash-screen"]
+# Guest visitors get an Ant Design welcome modal that swallows the send click.
+BLOCKER_SELECTORS = [
+    ".ant-modal-mask",
+    ".ant-modal-wrap",
+    "[class*='welcome-modal']",
+]
+BLOCKER_CLOSE_SELECTORS = [
+    ".ant-modal-close",
+    "button.ant-modal-close",
+    "[aria-label='Close']",
+]
 SIGN_IN_SELECTORS = [
+    # The guest auth page defaults to 验证码登录; the password form (and its
+    # inputs) only exist after clicking 使用密码登录.
+    "text=使用密码登录",
+    "text=使用验证码登录",
+    "input[placeholder*='电子邮箱']",
+    "input[placeholder*='邮箱']",
+    ".qwenchat-page-auth",
+    "input[type='password']",
     ".qwenchat-auth-pc-input-items",
     "button.qwenchat-auth-pc-submit-button",
-    "input[type='password']",
     "button:has-text('Log in')",
     "button:has-text('Sign in')",
-    "button:has-text('登录')",
 ]
 ASSISTANT_SELECTORS = [
-    ".response-message-content.phase-answer",
-    ".qwen-chat-message-assistant .qwen-markdown",
     ".qwen-chat-message-assistant",
     ".chat-response-message",
 ]
+# The answer text lives in .response-message-content; the thinking status card
+# (已经完成思考) and the multi-candidate feedback widget are siblings, so reading
+# the whole message node would leak chrome into the answer.
+ANSWER_TEXT_SELECTORS = [
+    ".response-message-content.phase-answer",
+    ".response-message-content",
+    ".qwen-chat-message-assistant .qwen-markdown",
+]
+THINKING_CHROME_RE = re.compile(
+    r"^(已经完成思考|思考完成|已完成思考|正在思考|深度思考|思考中|"
+    r"Thought completed|Thinking|Thought about.*|Thought for.*)[.。…\s]*$",
+    flags=re.IGNORECASE,
+)
+# Qwen sometimes answers with two candidates and asks which one to keep; that
+# widget must never be returned as the answer.
+FEEDBACK_NOISE_RE = re.compile(
+    r"(此反馈将帮助我们评估并提升\s*Qwen\s*的体验。?|"
+    r"你更喜欢哪个回复？请选择一个以继续。?|"
+    r"我更喜欢这个回复|"
+    r"Which response do you prefer\??|I prefer this response)",
+    flags=re.IGNORECASE,
+)
+# Citation "show more" chip renders as a bare "+18" line under the answer.
+CITATION_COUNTER_RE = re.compile(r"^\+\d{1,3}$")
+# Send button only exists once the composer has text; the stop button
+# (button.stop-button, aria-label 停止) shows up as soon as a reply starts.
 SEND_SELECTORS = [
+    "div.message-input-right-button-send",
     "div.chat-prompt-send-button button",
     "button:has-text('发送')",
     "button:has-text('Send')",
@@ -101,11 +194,11 @@ SEND_SELECTORS = [
 ]
 STOP_SELECTORS = [
     "button.stop-button",
-    "button:has-text('停止')",
-    "button:has-text('Stop')",
+    "[class*='stop-button']",
     "[aria-label*='Stop']",
     "[aria-label*='停止']",
-    "div.chat-prompt-send-button button.stop-button",
+    "button:has-text('停止')",
+    "button:has-text('Stop')",
 ]
 NEW_CHAT_SELECTORS = [
     "div.sidebar-entry-fixed-list-content:has-text('New Chat')",
@@ -353,7 +446,8 @@ class QwenClient:
             "state": state,
             "url": slot.page.url,
             "busy": slot.busy,
-            "logged_in": self._has_token_cookie_in(slot.context),
+            "logged_in": self._has_token_cookie_in(slot.context)
+            and not self._ui_shows_guest(slot.page),
         }
 
     def _publish_status(self) -> None:
@@ -445,29 +539,31 @@ class QwenClient:
     def _ensure_ready_impl(self) -> dict[str, Any]:
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
-        # Guest chat also shows the textarea; when credentials are configured,
-        # require a real login cookie instead of treating guest as ready.
-        if self._needs_account_login() and not self._has_token_cookie():
-            ok = self._ensure_logged_in(page, force=True)
-            state = self._detect_shell_state(page)
-            if not ok or state != "chat" or not self._has_token_cookie():
+        if state == "loading":
+            # #splash-screen covers the composer right after navigation; the
+            # textarea is already "visible" underneath it, so wait it out
+            # instead of reloading or reporting a false ready.
+            state = self._wait_shell_state(page, timeout_ms=60_000)
+        # Qwen now requires a login to send; a guest shell shows the textarea
+        # plus a welcome modal but silently drops every message.
+        if self._needs_account_login() and not self._logged_in(page):
+            if not self._ensure_logged_in(page, force=True):
                 raise RuntimeError(self._login_failed_message())
         elif state == "auth":
-            ok = self._ensure_logged_in(page)
-            state = self._detect_shell_state(page)
-            if not ok or state != "chat":
+            if not self._ensure_logged_in(page):
                 raise RuntimeError(self._login_failed_message())
         elif state != "chat":
             self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
-            if self._needs_account_login() and not self._has_token_cookie():
+            if self._needs_account_login() and not self._logged_in(page):
                 if not self._ensure_logged_in(page, force=True):
                     raise RuntimeError(self._login_failed_message())
             elif state == "auth" and not self._ensure_logged_in(page):
                 raise RuntimeError(self._login_failed_message())
-            state = self._detect_shell_state(page)
-            if state != "chat":
-                raise RuntimeError(f"chat UI not ready, state={state}")
+        self._dismiss_blocker(page)
+        state = self._detect_shell_state(page)
+        if state != "chat":
+            raise RuntimeError(f"chat UI not ready, state={state}")
         self._save_storage_unlocked()
         self._refresh_slot_status(self._current_slot())
         return {
@@ -476,7 +572,7 @@ class QwenClient:
             "state": state,
             "url": page.url,
             "session_saved": db_mgr.has_browser_session(PROVIDER),
-            "logged_in": self._has_token_cookie(),
+            "logged_in": self._logged_in(page),
             "worker_id": self._current_slot().worker_id,
         }
 
@@ -504,6 +600,14 @@ class QwenClient:
             question = "请描述这张图片" if len(image_list) == 1 else "请理解这些图片"
 
         resolved_mode = self._normalize_mode(mode)
+        # "think"/"fast" (and the expert/instant aliases behind them) are
+        # thinking-selector choices, so they must also drive the timeout:
+        # a deep-thinking reply needs the longer budget, not the chat one.
+        thinking = THINKING_ALIASES.get(resolved_mode)
+        if thinking == "think":
+            deep_thinking = True
+        elif thinking == "fast":
+            deep_thinking = False
         timeout_s = self._resolve_chat_timeout_s(
             timeout_s,
             deep_thinking=deep_thinking,
@@ -566,6 +670,9 @@ class QwenClient:
         slot = self._current_slot()
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
+        if state == "loading":
+            self._wait_shell_state(page, timeout_ms=60_000)
+            state = self._detect_shell_state(page)
         logger.info(
             "ask start worker=%s state=%s conv=%s mode=%s think=%s search=%s images=%s chars=%s timeout_s=%s question=%s",
             slot.worker_id,
@@ -579,7 +686,7 @@ class QwenClient:
             timeout_s,
             question,
         )
-        if self._needs_account_login() and not self._has_token_cookie():
+        if self._needs_account_login() and not self._logged_in(page):
             if not self._ensure_logged_in(page, force=True):
                 raise RuntimeError(
                     "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env "
@@ -597,7 +704,7 @@ class QwenClient:
         if state != "chat":
             self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
-            if self._needs_account_login() and not self._has_token_cookie():
+            if self._needs_account_login() and not self._logged_in(page):
                 if not self._ensure_logged_in(page, force=True):
                     raise RuntimeError(
                         "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
@@ -607,8 +714,9 @@ class QwenClient:
                     "not logged in; check QWEN_USERNAME/QWEN_PASSWORD in .env"
                 )
             state = self._detect_shell_state(page)
-            if state != "chat":
-                raise RuntimeError(f"chat UI not ready, state={state}")
+        if state != "chat":
+            raise RuntimeError(f"chat UI not ready, state={state}")
+        self._dismiss_blocker(page)
 
         if conversation_id:
             self._open_conversation(page, conversation_id)
@@ -631,6 +739,18 @@ class QwenClient:
                 self._attach_images(page, local_paths)
             self._enter_message(page, question)
             self._send_message(page)
+            try:
+                self._confirm_sent(page, before_count=before)
+            except RuntimeError:
+                # A session can go stale while the page sits idle: the shell
+                # keeps rendering (guest mode) and the composer silently drops
+                # the message. Re-login once and resend before giving up.
+                if not self._recover_stale_send(page):
+                    raise
+                before = self._assistant_count(page)
+                self._enter_message(page, question)
+                self._send_message(page)
+                self._confirm_sent(page, before_count=before)
             answer = self._wait_answer(page, before_count=before, timeout_s=timeout_s)
         finally:
             if temp_dir is not None:
@@ -683,12 +803,13 @@ class QwenClient:
 
     @staticmethod
     def _normalize_mode(mode: str | None) -> str:
+        """Return "auto", "think"/"fast", or a concrete page model label."""
         raw = (mode or "auto").strip()
         key = raw.lower()
         if key in MODE_ALIASES:
             return MODE_ALIASES[key]
-        # Allow passing a concrete model label, e.g. "Qwen3.5-Plus".
-        if raw and raw.lower() != "auto":
+        # Allow passing a concrete model label from the page, e.g. "Qwen3.7-Plus".
+        if raw and key != "auto":
             return raw
         return "auto"
 
@@ -702,132 +823,139 @@ class QwenClient:
         switch_mode: bool = True,
     ) -> str:
         actual_mode = mode
-        if switch_mode and mode and mode != "auto":
+        # "think"/"fast" are thinking-selector choices, not model names.
+        thinking = THINKING_ALIASES.get(mode)
+        if thinking == "think":
+            deep_thinking = True
+        elif thinking == "fast":
+            deep_thinking = False
+        if switch_mode and mode and mode not in ("auto", "think", "fast"):
             actual_mode = self._select_model(page, mode) or mode
-        self._set_thinking_mode(page, enabled=deep_thinking)
+        self._set_thinking_mode(page, deep_thinking=deep_thinking, mode=mode)
         self._set_search_mode(page, enabled=search)
         return actual_mode
 
-    def _select_model(self, page: Page, mode: str) -> str | None:
-        trigger = page.locator(
-            "[class*='model-selector-text'], "
-            "div[class*='model-selector'], "
-            "button:has-text('Qwen')"
-        )
-        if trigger.count() == 0:
-            logger.warning("model selector not found; keep mode=%s", mode)
+    def _select_model(self, page: Page, model: str) -> str | None:
+        """Pick a model in the .wms-trigger dropdown; return the label chosen."""
+        trigger = None
+        for selector in MODEL_TRIGGER_SELECTORS:
+            loc = page.locator(selector)
+            if loc.count() > 0 and loc.first.is_visible():
+                trigger = loc.first
+                break
+        if trigger is None:
+            logger.warning("model selector not found; keep mode=%s", model)
             return None
+
         try:
-            trigger.first.click(timeout=5_000)
-            time.sleep(0.4)
+            current = (
+                page.locator(".wms-trigger__text").first.inner_text(timeout=2_000) or ""
+            ).strip()
+        except Exception:
+            current = ""
+        if current and current.lower() == model.lower():
+            logger.info("model already=%s", current)
+            return current
+
+        try:
+            trigger.click(timeout=8_000)
+            time.sleep(0.6)
         except Exception as exc:
             logger.warning("open model selector failed: %s", exc)
             return None
 
-        popup = page.locator("div[class*='model-selector-popup'], [role='menu'], ul")
-        option = page.locator(
-            f"div[class*='model-selector-popup'] *:has-text('{mode}'), "
-            f"[role='menuitem']:has-text('{mode}'), "
-            f"li:has-text('{mode}'), "
-            f"div:has-text('{mode}')"
-        )
         try:
-            if option.count() > 0:
-                option.first.click(timeout=5_000)
-                logger.info("model set to %s", mode)
-                time.sleep(0.3)
-                return mode
+            option = page.locator("div.wms-list__item").filter(has_text=model)
+            if option.count() == 0:
+                option = page.locator(
+                    f"[role='option']:has-text('{model}'), "
+                    f"li:has-text('{model}'), "
+                    f"div[class*='wms-list__item']:has-text('{model}')"
+                )
+            if option.count() == 0:
+                logger.warning("model option not found: %s", model)
+                return None
+            option.first.click(timeout=8_000)
+            time.sleep(0.5)
+            chosen = ""
+            try:
+                chosen = (
+                    page.locator(".wms-trigger__text").first.inner_text(timeout=2_000)
+                    or ""
+                ).strip()
+            except Exception:
+                chosen = ""
+            logger.info("model set to %s (selector=%s)", model, chosen or "?")
+            return chosen or model
         except Exception as exc:
-            logger.warning("select model %s failed: %s", mode, exc)
+            logger.warning("select model %s failed: %s", model, exc)
+            return None
         finally:
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            _ = popup
-        logger.warning("model option not found: %s", mode)
-        return None
 
-    def _set_thinking_mode(self, page: Page, *, enabled: bool) -> None:
-        """Qwen thinking control: Thinking / Fast (or 思考 / 快速)."""
-        wanted = ("Thinking", "思考", "深度思考") if enabled else ("Fast", "快速", "极速")
-        trigger = page.locator(
-            "span.ant-select-selection-item:has(div.qwen-select-thinking-label), "
-            "div.qwen-select-thinking-label, "
-            "span.qwen-select-thinking-label-text"
-        )
-        if trigger.count() == 0:
-            # Fallback text buttons.
-            for text in ("深度思考", "Thinking", "思考"):
-                loc = page.locator(
-                    f"button:has-text('{text}'), [role='button']:has-text('{text}')"
-                )
-                if loc.count() == 0:
-                    continue
-                btn = loc.first
-                class_attr = (btn.get_attribute("class") or "").lower()
-                aria = (btn.get_attribute("aria-pressed") or "").lower()
-                active = (
-                    "active" in class_attr
-                    or "selected" in class_attr
-                    or aria == "true"
-                )
-                if active != enabled:
-                    try:
-                        btn.click(timeout=3_000)
-                        logger.info("thinking toggled via text=%s enabled=%s", text, enabled)
-                        time.sleep(0.2)
-                    except Exception:
-                        continue
-                return
-            if enabled:
-                logger.warning("thinking control not found")
+    def _set_thinking_mode(
+        self,
+        page: Page,
+        *,
+        deep_thinking: bool,
+        mode: str = "auto",
+    ) -> None:
+        """Qwen thinking control: 自动 / 思考 / 快速.
+
+        Default is 自动; only switch when the caller asked for something
+        explicit (mode=think/fast) or wants deep thinking.
+        """
+        explicit = THINKING_ALIASES.get(mode)
+        if not deep_thinking and explicit != "fast":
+            # Keep the page's 自动 default instead of forcing 快速.
+            return
+        wanted_label = THINKING_LABELS["think" if deep_thinking else "fast"]
+
+        trigger = None
+        for selector in THINKING_TRIGGER_SELECTORS:
+            loc = page.locator(selector)
+            if loc.count() > 0 and loc.first.is_visible():
+                trigger = loc.first
+                break
+        if trigger is None:
+            logger.warning("thinking control not found wanted=%s", wanted_label)
             return
 
         try:
-            current = (
-                page.locator("span.qwen-select-thinking-label-text").first.inner_text(
-                    timeout=2_000
-                )
-                or ""
-            ).strip()
+            current = (trigger.inner_text(timeout=2_000) or "").strip()
         except Exception:
             current = ""
-        if any(w.lower() in current.lower() for w in wanted):
-            logger.info("thinking already=%s current=%s", enabled, current)
+        if wanted_label in current:
+            logger.info("thinking already=%s", wanted_label)
             return
 
         try:
-            trigger.first.click(timeout=4_000)
-            time.sleep(0.3)
+            trigger.click(timeout=5_000)
+            time.sleep(0.5)
         except Exception as exc:
             logger.warning("open thinking dropdown failed: %s", exc)
             return
 
-        clicked = False
-        for label in wanted:
-            opt = page.locator(
-                f"div.rc-virtual-list-holder-inner *:has-text('{label}'), "
-                f"div.qwen-select-thinking-label:has-text('{label}'), "
-                f"[role='option']:has-text('{label}'), "
-                f"li:has-text('{label}')"
-            )
-            if opt.count() == 0:
-                continue
-            try:
-                opt.first.click(timeout=3_000)
-                clicked = True
-                logger.info("thinking set to %s", label)
-                time.sleep(0.2)
-                break
-            except Exception:
-                continue
-        if not clicked and enabled:
-            logger.warning("thinking option not found wanted=%s", wanted)
         try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
+            for selector in THINKING_OPTION_SELECTORS:
+                opt = page.locator(selector).filter(has_text=wanted_label)
+                if opt.count() == 0:
+                    continue
+                opt.first.click(timeout=5_000)
+                time.sleep(0.4)
+                logger.info("thinking set to %s", wanted_label)
+                return
+            logger.warning("thinking option not found wanted=%s", wanted_label)
+        except Exception as exc:
+            logger.warning("select thinking %s failed: %s", wanted_label, exc)
+        finally:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
 
     def _set_search_mode(self, page: Page, *, enabled: bool) -> None:
         """Toggle web search via mode-select (best-effort)."""
@@ -1091,6 +1219,12 @@ class QwenClient:
 
     @staticmethod
     def _has_token_cookie_in(context: BrowserContext | None) -> bool:
+        """True when the context carries a Qwen credential.
+
+        The current frontend stores the JWT in localStorage and only sets a
+        `refresh_token` cookie, so a cookie literally named `token` is no
+        longer required (and is absent after a fresh login).
+        """
         if context is None:
             return False
         try:
@@ -1101,49 +1235,105 @@ class QwenClient:
             name = str(cookie.get("name") or "")
             value = str(cookie.get("value") or "")
             domain = str(cookie.get("domain") or "")
-            if name == "token" and value and "qwen.ai" in domain:
+            if not value or "qwen.ai" not in domain:
+                continue
+            if name in ("token", "refresh_token"):
                 return True
         return False
 
+    @staticmethod
+    def _has_local_storage_token(page: Page | None) -> bool:
+        if page is None:
+            return False
+        try:
+            return bool(page.evaluate("() => !!localStorage.getItem('token')"))
+        except Exception:
+            return False
+
     def _has_token_cookie(self) -> bool:
-        return self._has_token_cookie_in(self._current_slot().context)
+        slot = self._current_slot()
+        return self._has_token_cookie_in(slot.context) or self._has_local_storage_token(
+            slot.page
+        )
 
     def _needs_account_login(self) -> bool:
         return bool(self.auto_login and self.username and self.password)
 
+    def _logged_in(self, page: Page) -> bool:
+        """True when the page is a usable, authenticated chat shell."""
+        return self._has_token_cookie() and not self._ui_shows_guest(page)
+
+    @staticmethod
+    def _ui_shows_guest(page: Page) -> bool:
+        """Qwen shows 登录/注册 in the header for guests, even with a stale cookie."""
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                        const btns = Array.from(document.querySelectorAll('button'))
+                            .filter(b => b.offsetWidth || b.offsetHeight);
+                        return btns.some(b => /^(登录|注册|Log in|Sign in)$/.test(
+                            (b.innerText || '').trim()));
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
     def _ensure_logged_in(self, page: Page, *, force: bool = False) -> bool:
-        if self._has_token_cookie() and self._detect_shell_state(page) == "chat":
+        if self._logged_in(page):
             return True
         state = self._detect_shell_state(page)
-        if state == "chat" and not force:
+        if state == "loading":
+            self._wait_shell_state(page, timeout_ms=30_000)
+            if self._logged_in(page):
+                return True
+            state = self._detect_shell_state(page)
+        if state == "chat" and not force and not self._ui_shows_guest(page):
             # Guest chat UI is usable without login cookie.
             return True
         if not self.auto_login:
-            logger.warning("auth page but QWEN_AUTO_LOGIN disabled")
+            logger.warning("auth required but QWEN_AUTO_LOGIN disabled")
             return False
         if not self.username or not self.password:
-            logger.warning("auth page but QWEN_USERNAME/QWEN_PASSWORD missing in .env")
+            logger.warning("auth required but QWEN_USERNAME/QWEN_PASSWORD missing in .env")
             return False
         try:
             self._password_login(page)
         except Exception as exc:
             logger.exception("password login failed: %s", exc)
             return False
-        state = self._wait_shell_state(page, timeout_ms=60_000)
-        if state == "chat" and self._has_token_cookie():
-            self._save_storage_unlocked()
-            logger.info(
-                "password login ok worker=%s storage saved",
+        if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
+            logger.error(
+                "password login finished but state=%s worker=%s",
+                self._detect_shell_state(page),
                 self._current_slot().worker_id,
             )
-            return True
-        logger.error(
-            "password login finished but state=%s token=%s worker=%s",
-            state,
-            self._has_token_cookie(),
+            return False
+        self._dismiss_blocker(page)
+        self._save_storage_unlocked()
+        logger.info(
+            "password login ok worker=%s storage saved",
             self._current_slot().worker_id,
         )
-        return False
+        return True
+
+    def _open_password_tab(self, page: Page) -> None:
+        """The auth page defaults to 验证码登录; switch to the password form."""
+        if page.locator("input[type='password']").count() > 0:
+            return
+        for selector in ("text=使用密码登录", "text=密码登录", "a:has-text('密码登录')"):
+            try:
+                loc = page.locator(selector)
+                if loc.count() == 0:
+                    continue
+                loc.first.click(timeout=10_000)
+                time.sleep(1.0)
+                if page.locator("input[type='password']").count() > 0:
+                    return
+            except Exception:
+                continue
+        raise RuntimeError("password login tab not found")
 
     def _password_login(self, page: Page) -> None:
         assert self.username and self.password
@@ -1154,33 +1344,36 @@ class QwenClient:
         )
         if "/auth" not in (page.url or "").lower():
             self._goto(page, AUTH_URL)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(0.8)
+        try:
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+        time.sleep(1.0)
+        self._wait_no_blocker(page, timeout_ms=20_000)
 
-        page.wait_for_selector(
-            ".qwenchat-auth-pc-input-items, input[type='password']",
-            timeout=30_000,
+        page.wait_for_selector("input[type='text'], input[type='email']", timeout=30_000)
+        self._open_password_tab(page)
+
+        account = page.locator(
+            "input[placeholder*='邮箱'], input[placeholder*='邮件'], "
+            "input[placeholder*='Email'], input[type='email'], "
+            "input[autocomplete='username'], input[type='text']"
         )
-
-        root = page.locator(".qwenchat-auth-pc-input-items")
-        if root.count() > 0:
-            account = root.first.locator("input:not([type='password'])")
-        else:
-            account = page.locator(
-                "input[type='email'], input[placeholder*='邮箱'], "
-                "input[placeholder*='Email'], input[autocomplete='username'], "
-                "input:not([type='password'])"
-            )
         if account.count() == 0:
             raise RuntimeError("login account input not found")
         account.first.fill(self.username, timeout=15_000)
-        page.locator("input[type='password']").first.fill(self.password, timeout=15_000)
+        password_input = page.locator("input[type='password']")
+        password_input.first.fill(self.password, timeout=15_000)
 
+        # The submit button is the black 登录 button (class
+        # qwenchat-auth-pc-submit-button); exclude 使用验证码登录 / 使用 X 登录.
         submit = page.locator("button.qwenchat-auth-pc-submit-button")
         if submit.count() == 0:
+            submit = page.locator("button").filter(has_text=re.compile(r"^\s*登录\s*$"))
+        if submit.count() == 0:
             submit = page.locator(
-                "button:has-text('登录'), button:has-text('Log in'), "
-                "button:has-text('Sign in'), button[type='submit']"
+                "button:has-text('Log in'), button:has-text('Sign in'), "
+                "button[type='submit']"
             )
         if submit.count() == 0:
             raise RuntimeError("login button not found")
@@ -1188,11 +1381,14 @@ class QwenClient:
 
         deadline = time.time() + 90
         while time.time() < deadline:
-            if self._has_token_cookie() or self._detect_shell_state(page) == "chat":
+            state = self._detect_shell_state(page)
+            if state == "chat":
+                break
+            if self._has_token_cookie() and not self._ui_shows_guest(page):
                 break
             time.sleep(0.5)
         else:
-            raise RuntimeError("login submit did not set token cookie")
+            raise RuntimeError("login submit did not reach the chat UI")
 
         if self._detect_shell_state(page) != "chat":
             self._goto(page, CHAT_URL)
@@ -1219,7 +1415,51 @@ class QwenClient:
                 continue
         return False
 
+    def _has_blocker(self, page: Page) -> bool:
+        """True while #splash-screen or a modal overlays the composer."""
+        for selector in SPLASH_SELECTORS + BLOCKER_SELECTORS:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 4)
+                for i in range(count):
+                    if loc.nth(i).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _dismiss_blocker(self, page: Page) -> bool:
+        """Close the guest welcome modal; return True when something was closed."""
+        closed = False
+        for selector in BLOCKER_CLOSE_SELECTORS:
+            try:
+                loc = page.locator(selector)
+                if loc.count() == 0 or not loc.first.is_visible():
+                    continue
+                loc.first.click(timeout=3_000)
+                closed = True
+                time.sleep(0.5)
+                break
+            except Exception:
+                continue
+        if closed:
+            logger.info("dismissed blocking modal worker=%s", self._current_slot().worker_id)
+        return closed
+
+    def _wait_no_blocker(self, page: Page, timeout_ms: int = 30_000) -> bool:
+        deadline = time.time() + timeout_ms / 1000
+        while time.time() < deadline:
+            if not self._has_blocker(page):
+                return True
+            self._dismiss_blocker(page)
+            time.sleep(0.25)
+        return not self._has_blocker(page)
+
     def _detect_shell_state(self, page: Page) -> str:
+        # The chat textarea renders under #splash-screen before hydration, so a
+        # visible textarea alone is not proof that the shell is usable.
+        if self._has_blocker(page):
+            return "loading"
         if self._has_visible(page, CHAT_READY_SELECTORS):
             return "chat"
         url = (page.url or "").lower()
@@ -1230,13 +1470,18 @@ class QwenClient:
         return "unknown"
 
     def _wait_shell_state(self, page: Page, timeout_ms: int = 60_000) -> str:
+        """Wait for a settled state; 'loading' is transient, not settled."""
         deadline = time.time() + timeout_ms / 1000
+        last = "unknown"
         while time.time() < deadline:
             state = self._detect_shell_state(page)
-            if state != "unknown":
+            if state == "loading":
+                self._dismiss_blocker(page)
+            elif state != "unknown":
                 return state
+            last = state
             time.sleep(0.25)
-        return self._detect_shell_state(page)
+        return last if last != "unknown" else self._detect_shell_state(page)
 
     def _textarea(self, page: Page):
         for selector in CHAT_READY_SELECTORS:
@@ -1434,6 +1679,74 @@ class QwenClient:
                 continue
         self._textarea(page).press("Enter")
 
+    def _confirm_sent(self, page: Page, *, before_count: int) -> None:
+        """Fail fast when the click did not actually start a reply.
+
+        A blocked composer (guest welcome modal, splash overlay) accepts the
+        click but drops the message, which used to burn the whole timeout.
+        """
+        deadline = time.time() + SEND_CONFIRM_S
+        original_url = page.url
+        while time.time() < deadline:
+            if self._assistant_count(page) > before_count:
+                return
+            if self._conversation_id_from_url(page.url) != self._conversation_id_from_url(
+                original_url
+            ):
+                return
+            if self._is_generating(page):
+                return
+            if not self._textarea_value(page):
+                return
+            time.sleep(0.25)
+
+        if self._has_blocker(page):
+            self._dismiss_blocker(page)
+            raise RuntimeError(
+                "message not sent: a modal/overlay blocks the composer "
+                "(not logged in?)"
+            )
+        raise RuntimeError("message not sent: no reply started and the input kept its text")
+
+    def _recover_stale_send(self, page: Page) -> bool:
+        """Re-login when the send failed because the session went stale.
+
+        Returns True when a fresh login is in place and the caller should
+        retry. Any other failure mode returns False so the original error
+        (which is more informative) propagates.
+        """
+        self._dismiss_blocker(page)
+        if not self._needs_account_login():
+            logger.warning("send did not start: no reply and no auto-login available")
+            return False
+        try:
+            self._goto(page, CHAT_URL)
+            self._wait_shell_state(page, timeout_ms=30_000)
+        except Exception:
+            pass
+        if self._logged_in(page):
+            # Genuinely logged in: the send failed for another reason.
+            logger.warning("send did not start although logged_in=true; not re-logging in")
+            return False
+        logger.warning(
+            "send did not start and session looks stale; re-login worker=%s",
+            self._current_slot().worker_id,
+        )
+        try:
+            if not self._ensure_logged_in(page, force=True):
+                return False
+        except Exception as exc:
+            logger.exception("re-login after failed send errored: %s", exc)
+            return False
+        self._dismiss_blocker(page)
+        return self._detect_shell_state(page) == "chat"
+
+    def _textarea_value(self, page: Page) -> str:
+        try:
+            return (self._textarea(page).input_value(timeout=2_000) or "").strip()
+        except Exception:
+            return ""
+
     def _open_new_chat(self, page: Page) -> None:
         for selector in NEW_CHAT_SELECTORS:
             loc = page.locator(selector)
@@ -1460,26 +1773,70 @@ class QwenClient:
         except Exception:
             return 0
 
-    def _last_assistant_text(self, page: Page) -> str:
-        loc = self._assistant_locator(page)
-        count = loc.count()
-        if count <= 0:
-            return ""
+    def _last_assistant_node(self, page: Page):
+        """Locator for the newest assistant message, or None."""
         try:
-            text = (loc.nth(count - 1).inner_text() or "").strip()
-            # Strip thinking status chrome if it leaked into the node.
-            lines = [
-                line
-                for line in text.splitlines()
-                if not re.match(
-                    r"^(Thought completed|思考完成|Thinking|深度思考).*$",
-                    line.strip(),
-                    flags=re.IGNORECASE,
-                )
-            ]
-            return "\n".join(lines).strip()
+            loc = self._assistant_locator(page)
+            count = loc.count()
+        except Exception:
+            return None
+        if count <= 0:
+            return None
+        return loc.nth(count - 1)
+
+    def _answer_text(self, page: Page) -> str:
+        """Read only the answer container of the newest assistant message.
+
+        Reading the whole message node used to capture the thinking status card
+        (已经完成思考) and, when Qwen offers several candidates, the
+        "你更喜欢哪个回复" feedback widget instead of the answer.
+        """
+        node = self._last_assistant_node(page)
+        if node is None:
+            return ""
+        for selector in ANSWER_TEXT_SELECTORS:
+            try:
+                loc = node.locator(selector)
+                count = loc.count()
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            for index in range(count - 1, -1, -1):
+                try:
+                    text = (loc.nth(index).inner_text() or "").strip()
+                except Exception:
+                    continue
+                text = self._strip_thinking_chrome(text)
+                if text:
+                    return text
+        # Last resort: some render paths have no .response-message-content; read
+        # the whole node and strip the chrome by hand.
+        try:
+            return self._strip_thinking_chrome((node.inner_text() or "").strip())
         except Exception:
             return ""
+
+    @staticmethod
+    def _strip_thinking_chrome(text: str) -> str:
+        """Drop leftover thinking-card labels and the candidate feedback widget."""
+        lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                lines.append("")
+                continue
+            if THINKING_CHROME_RE.match(stripped):
+                continue
+            if FEEDBACK_NOISE_RE.search(stripped):
+                continue
+            if CITATION_COUNTER_RE.match(stripped):
+                continue
+            lines.append(line)
+        cleaned = "\n".join(lines).strip()
+        # The feedback widget can also be inlined without newlines.
+        cleaned = FEEDBACK_NOISE_RE.sub("", cleaned).strip()
+        return cleaned
 
     def _is_generating(self, page: Page) -> bool:
         for selector in STOP_SELECTORS:
@@ -1509,7 +1866,7 @@ class QwenClient:
                 saw_new = True
             # Only read assistant text after a new bubble appears; otherwise stale
             # text from the previous chat can be returned as a false success.
-            text = self._last_assistant_text(page) if saw_new else ""
+            text = self._answer_text(page) if saw_new else ""
             generating = self._is_generating(page)
             if generating:
                 stable = 0

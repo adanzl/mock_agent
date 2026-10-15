@@ -88,10 +88,10 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
 | --- | --- | --- | --- | --- |
 | `question` | string | 条件必填 | — | 用户问题（别名：`prompt` / `message`）；无图时必填，有图时可省略（用默认提示） |
 | `conversation_id` | string | 否 | 无 | **有则续聊，无则新开**（别名：`chat_id`） |
-| `mode` | string | 否 | `auto` | 模型（别名：`model`）；`auto` 不切换 |
-| `deep_thinking` | bool | 否 | `false` | 深度思考 / Thinking（别名：`think` / `deep_think`） |
+| `mode` | string | 否 | `auto` | 思考档位或模型（别名：`model`）；`auto` 不切换。见下「`mode` 取值」 |
+| `deep_thinking` | bool | 否 | `false` | 深度思考 / Thinking（别名：`think` / `deep_think`）；`mode=expert`/`think` 也会开启 |
 | `search` | bool | 否 | `false` | 联网搜索（别名：`web_search` / `smart_search`） |
-| `timeout` | int | 否 | 见下 | 等待回复秒数；不传时：普通 `QWEN_CHAT_TIMEOUT_S`(默认 300)，深度思考用 `QWEN_THINK_TIMEOUT_S`(默认 600) |
+| `timeout` | int | 否 | 见下 | 等待回复秒数；不传时：普通 `QWEN_CHAT_TIMEOUT_S`(默认 300)，深度思考（含 `mode=expert`/`think`）用 `QWEN_THINK_TIMEOUT_S`(默认 600) |
 | `image` / `images` | string / string[] | 否 | 无 | 图片理解：公网 `http(s)` URL、`data:image/...;base64,...`、或纯 base64（别名：`image_url` / `image_base64`）。最多 4 张，单张 ≤ 10MB |
 | multipart 文件 | file | 否 | 无 | 也可用 `multipart/form-data` 上传，字段名：`image` / `images` / `file` / `files` |
 
@@ -127,17 +127,27 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
 
 ### `mode` 取值
 
+`mode` 既可以是**思考档位**，也可以是**具体模型**：
+
 | 值 | 含义 |
 | --- | --- |
-| `auto` / `default` | 不切换模型，沿用页面当前选择 |
-| `plus` / `qwen3.5-plus` | 尝试选 `Qwen3.5-Plus` |
-| `flash` / `qwen3.5-flash` | 尝试选 `Qwen3.5-Flash` |
-| `max` / `qwen3-max` | 尝试选 `Qwen3-Max` |
-| 其它字符串 | 按页面模型选择器文案精确匹配（如 `Qwen3.6-Plus`） |
+| `auto` / `default` | 不切换模型、不切换思考档位 |
+| `instant` / `fast` / `quick` / `快速` | 思考档位设为「快速」（不切模型） |
+| `expert` / `think` / `thinking` / `专家` / `思考` | 思考档位设为「思考」（不切模型） |
+| `plus` / `qwen3.7-plus` | 选 `Qwen3.7-Plus` |
+| `max` / `qwen3.8-max` | 选 `Qwen3.8-Max` |
+| `omni` / `flash` / `qwen3.8-omni-flash` | 选 `Qwen3.8-Omni-Flash` |
+| `qwen3.5-plus` / `qwen3.6-plus` | 历史别名，映射到 `Qwen3.7-Plus` |
+| `qwen3.5-flash` | 历史别名，映射到 `Qwen3.8-Omni-Flash` |
+| `qwen3-max` | 历史别名，映射到 `Qwen3.8-Max` |
+| 其它字符串 | 按页面模型选择器文案精确匹配（如 `Qwen3.7-Plus`） |
+
+思考档位走页面右上角的思考选择器（`自动` / `思考` / `快速`），响应里的 `mode` 会回显实际生效值（`fast` 或 `think`），模型则回显页面上的模型文案。
 
 说明：
 
 - **模型只在新对话时尝试切换**；带 `conversation_id` 续聊时不切换 `mode`。
+- `instant` / `expert` 等思考档位别名会**同时决定超时**：`expert` 按深度思考用 `QWEN_THINK_TIMEOUT_S`，`instant` 用 `QWEN_CHAT_TIMEOUT_S`。
 - 页面 DOM 常变，模型 / 思考 / 搜索切换为 best-effort；失败会打日志，不阻断发消息。
 
 ### 成功响应
@@ -164,10 +174,12 @@ curl -s http://127.0.0.1:8765/api/qwen/chat \
 | HTTP | 含义 |
 | --- | --- |
 | 400 | 参数错误（缺 question 等） |
-| 401 | 未登录 / 自动登录失败 |
+| 401 | 未登录 / 自动登录失败，或登录态失效后重登重发仍失败 |
 | 503 | `QWEN_ENABLED=0` |
 | 504 | 等待回复超时 |
 | 500 | 其它异常 |
+
+`answer` 只取回答容器的文本（`.response-message-content`），不会带上「已经完成思考」这类思考卡片文案、候选回答的「你更喜欢哪个回复」反馈控件，或引用来源的 `+18` 计数。
 
 ---
 
@@ -275,11 +287,32 @@ while True:
   "workers": 2,
   "busy": 0,
   "idle": 2,
-  "queued": 0
+  "queued": 0,
+  "workers_detail": [
+    {
+      "worker_id": 0,
+      "ready": true,
+      "state": "chat",
+      "url": "https://chat.qwen.ai/...",
+      "busy": false,
+      "logged_in": true,
+      "queued": 0
+    }
+  ]
 }
 ```
 
-`state` 常见值：`chat` / `auth` / `unknown` / `disabled`。
+`state` 常见值：
+
+| 值 | 含义 |
+| --- | --- |
+| `chat` | 聊天界面可用 |
+| `auth` | 停在登录页 |
+| `loading` | `#splash-screen` 或欢迎弹窗仍盖住输入框，前端尚未 hydrate（此时输入框虽可见也不能发消息） |
+| `unknown` | 未识别 |
+| `disabled` | `QWEN_ENABLED=0` |
+
+登录态以 `workers_detail[].logged_in` 为准；它等于「有 `token`/`refresh_token` cookie 或 `localStorage.token` **且** 页面上没有可见的 `登录`/`注册` 按钮」。
 
 ---
 
@@ -297,7 +330,11 @@ while True:
 
 登录由服务端自动完成：启动时、以及 `/chat` 发现未登录时，都会用 `.env` 的 `QWEN_USERNAME` / `QWEN_PASSWORD` 填表登录，并把登录态写入 SQLite（`browser_session`）。
 
-登录页：`https://chat.qwen.ai/auth`。成功标志为 `token` cookie（domain 含 `qwen.ai`）或聊天输入框可见。
+登录页：`https://chat.qwen.ai/auth`。该页默认是**验证码登录**，需要先点「使用密码登录」才会出现密码输入框，因此自动登录流程是：点 `使用密码登录` → 填邮箱（`input[placeholder*='邮箱']`）和密码（`input[type='password']`）→ 点 `button.qwenchat-auth-pc-submit-button`（文案「登录」）。
+
+判断是否已登录不能只看 cookie：新版前端把 JWT 放在 `localStorage.token`，cookie 只有 `refresh_token`；旧的 `token` cookie 即使服务端仍认，前端也会当作未登录（游客态会弹欢迎弹窗，发消息被静默丢弃）。所以登录判定为 `token`/`refresh_token` cookie（或 `localStorage.token`）**且** 页面上没有可见的 `登录`/`注册` 按钮。
+
+若发消息后 20 秒内既没出现新气泡、URL 也没变成 `/c/<id>`，会判定为登录态失效，自动重新登录并重发一次（见日志 `send did not start and session looks stale; re-login`）。
 
 ---
 
