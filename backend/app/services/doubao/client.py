@@ -55,54 +55,19 @@ def decode_qr_png(png: bytes) -> str | None:
     return None
 
 
-# Braille dots, top to bottom. Each character holds 2 columns x 4 rows.
-_BRAILLE_BITS = (
-    (0x01, 0x08),
-    (0x02, 0x10),
-    (0x04, 0x20),
-    (0x40, 0x80),
-)
-
-
 def format_qr_for_log(payload: str) -> str:
-    """Compact terminal QR. qrcode builds the matrix; braille packs 2x4 modules per cell."""
+    """Terminal QR from qrcode.print_ascii. Low ECC and a short border keep it smaller."""
     code = qrcode.QRCode(
         error_correction=qrcode.constants.ERROR_CORRECT_L,
-        border=4,
+        border=2,
     )
     code.add_data(payload)
     code.make(fit=True)
-    modules = code.modules
-    count = code.modules_count
-    border = code.border
-    size = count + border * 2
-    width = size + (size % 2)
-    height = size + (-size % 4)
-
-    def dark(row: int, col: int) -> bool:
-        if row >= size or col >= size:
-            return False
-        r = row - border
-        c = col - border
-        if r < 0 or c < 0 or r >= count or c >= count:
-            return False
-        return bool(modules[r][c])
-
-    fg = "\033[38;5;16m"
-    bg = "\033[48;5;231m"
-    reset = "\033[0m"
-    lines: list[str] = []
-    for y in range(0, height, 4):
-        chars: list[str] = []
-        for x in range(0, width, 2):
-            bits = 0
-            for dy in range(4):
-                for dx in range(2):
-                    if dark(y + dy, x + dx):
-                        bits |= _BRAILLE_BITS[dy][dx]
-            chars.append(chr(0x2800 + bits))
-        lines.append(f"{fg}{bg}{''.join(chars)}{reset}")
-    return "\n".join(lines)
+    buf = io.StringIO()
+    # print_ascii(tty=True) refuses non-ttys; the log is tailed in a terminal.
+    buf.isatty = lambda: True  # type: ignore[method-assign]
+    code.print_ascii(out=buf, tty=True)
+    return buf.getvalue().rstrip("\n")
 
 
 class DoubaoClient:
@@ -235,15 +200,15 @@ class DoubaoClient:
         self._open_chat()
         page = self._page
         assert page is not None
-        if self._logged_in(page):
+        if self._wait_until_logged_in(page, timeout_s=8):
             self._save_storage()
             self._state = "ready"
             logger.info("doubao: session reused profile=%s url=%s", self.user_data_dir, page.url)
             return self._status_payload(ready=True, state="ready")
-        self._restore_saved_cookies()
+        self._restore_saved_session()
         page = self._page
         assert page is not None
-        if self._logged_in(page):
+        if self._wait_until_logged_in(page, timeout_s=12):
             self._save_storage()
             self._state = "ready"
             logger.info("doubao: session restored from sqlite url=%s", page.url)
@@ -421,22 +386,49 @@ class DoubaoClient:
         except Exception:
             return False
 
-    def _restore_saved_cookies(self) -> None:
+    def _wait_until_logged_in(self, page: Page, *, timeout_s: int) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._logged_in(page):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _restore_saved_session(self) -> None:
         state = db_mgr.get_browser_session(PROVIDER)
         context = self._context
         page = self._page
         if not state or context is None or page is None:
             return
         cookies = state.get("cookies") or []
-        if not cookies:
-            return
         try:
-            context.add_cookies(cookies)
+            if cookies:
+                context.add_cookies(cookies)
+            self._goto(page, CHAT_URL)
+            self._apply_local_storage(page, state)
             self._goto(page, CHAT_URL)
             self._dismiss_promo(page)
-            logger.info("doubao: applied saved cookies count=%s", len(cookies))
+            logger.info("doubao: applied saved session cookies=%s", len(cookies))
         except Exception as exc:
-            logger.warning("doubao restore cookies failed: %s", exc)
+            logger.warning("doubao restore session failed: %s", exc)
+
+    def _apply_local_storage(self, page: Page, state: dict[str, Any]) -> None:
+        items: list[dict[str, Any]] = []
+        for origin in state.get("origins") or []:
+            if origin.get("origin") != "https://www.doubao.com":
+                continue
+            items.extend(origin.get("localStorage") or [])
+        if not items:
+            return
+        page.evaluate(
+            """(entries) => {
+                for (const item of entries) {
+                    if (!item || !item.name) continue;
+                    localStorage.setItem(item.name, item.value || '');
+                }
+            }""",
+            items,
+        )
 
     def _save_storage(self) -> None:
         context = self._context
