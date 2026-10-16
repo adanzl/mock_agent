@@ -7,6 +7,8 @@ import queue
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import unquote
@@ -151,7 +153,9 @@ class AgnesClient:
             _WorkerSlot(worker_id=i) for i in range(self.worker_count)
         ]
         self._pick_lock = threading.Lock()
-        self._launch_lock = threading.Lock()
+        self._launch_lock = threading.RLock()
+        self._direct_only = False
+        self._proxy_checked = False
         self._storage_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_status: dict[str, Any] | None = None
@@ -734,10 +738,42 @@ class AgnesClient:
             logger.warning("opened conv mismatch want=%s got=%s", conv, opened)
 
     def _proxy_kwargs(self) -> dict[str, Any]:
+        if self._direct_only:
+            return {}
         proxy = (self.proxy or "").strip()
         if not proxy:
             return {}
         return {"proxy": {"server": proxy}}
+
+    def _proxy_configured(self) -> bool:
+        return bool((self.proxy or "").strip()) and not self._direct_only
+
+    def _proxy_reaches(self, url: str) -> bool:
+        """True when the proxy returns any HTTP response for the site."""
+        proxy = (self.proxy or "").strip()
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(handler)
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with opener.open(request, timeout=8) as response:
+                response.read(1)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception as exc:
+            logger.info("agnes proxy probe failed proxy=%s error=%s", proxy, exc)
+            return False
+
+    def _drop_proxy(self, reason: str) -> None:
+        if not self._proxy_configured():
+            return
+        logger.warning(
+            "agnes proxy unreachable, using direct proxy=%s reason=%s",
+            self.proxy,
+            reason,
+        )
+        self._direct_only = True
+        self.proxy = ""
 
     def _launch_browser(self, playwright: Playwright) -> Browser:
         launch_args = [
@@ -804,23 +840,11 @@ class AgnesClient:
         with self._launch_lock:
             if slot.page is not None:
                 return
-            slot.playwright = sync_playwright().start()
-            slot.browser = self._launch_browser(slot.playwright)
-            context_kwargs: dict[str, Any] = {
-                "viewport": {"width": 1280, "height": 900},
-                "locale": "zh-CN",
-            }
-            stored = db_mgr.get_browser_session(PROVIDER)
-            if stored:
-                context_kwargs["storage_state"] = stored
-                logger.debug(
-                    "load storage_state from sqlite provider=%s worker=%s",
-                    PROVIDER,
-                    slot.worker_id,
-                )
-            slot.context = slot.browser.new_context(**context_kwargs)
-            slot.page = slot.context.new_page()
-            self._prepare_page(slot.page)
+            if self._proxy_configured() and not self._proxy_checked:
+                self._proxy_checked = True
+                if not self._proxy_reaches(CHAT_URL):
+                    self._drop_proxy("probe")
+            self._open_browser()
             slot.page = self._goto(slot.page, CHAT_URL)
         state = self._wait_shell_state(slot.page, timeout_ms=60_000)
         logger.debug(
@@ -829,6 +853,26 @@ class AgnesClient:
             state,
             slot.page.url,
         )
+
+    def _open_browser(self) -> None:
+        slot = self._current_slot()
+        slot.playwright = sync_playwright().start()
+        slot.browser = self._launch_browser(slot.playwright)
+        context_kwargs: dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 900},
+            "locale": "zh-CN",
+        }
+        stored = db_mgr.get_browser_session(PROVIDER)
+        if stored:
+            context_kwargs["storage_state"] = stored
+            logger.debug(
+                "load storage_state from sqlite provider=%s worker=%s",
+                PROVIDER,
+                slot.worker_id,
+            )
+        slot.context = slot.browser.new_context(**context_kwargs)
+        slot.page = slot.context.new_page()
+        self._prepare_page(slot.page)
 
     def _prepare_page(self, page: Page) -> None:
         page.set_default_timeout(self.timeout_ms)
@@ -899,6 +943,13 @@ class AgnesClient:
                 return page
             except Exception as exc:
                 last_exc = exc
+                if self._proxy_configured():
+                    self._drop_proxy("navigation")
+                    with self._launch_lock:
+                        self._stop_unlocked()
+                        self._open_browser()
+                        page = self._current_slot().page
+                    continue
                 if attempt >= attempts:
                     logger.warning(
                         "goto stuck attempt=%s/%s url=%s error=%s",

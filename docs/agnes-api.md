@@ -5,7 +5,7 @@
 默认地址：`http://127.0.0.1:8765`  
 前缀：`/api/agnes`
 
-浏览器流量默认走 `http://127.0.0.1:7890`（可用 `AGNES_PROXY` 覆盖）。DeepSeek / Qwen 模块不受影响。
+浏览器流量默认走 `http://127.0.0.1:7890`（可用 `AGNES_PROXY` 覆盖）。代理连不上站点时关掉代理，改直连再开浏览器。DeepSeek / Qwen 模块不受影响。
 
 **默认关闭**：需在 `.env` 设置 `AGNES_ENABLED=1` 后才会启动 / 接受 chat；未开启时 `/api/agnes/chat` 返回 503。
 
@@ -270,7 +270,7 @@ while True:
 | 变量 | 说明 |
 | --- | --- |
 | `AGNES_ENABLED` | 总开关，默认 `0`（关闭）；设为 `1` 开启 |
-| `AGNES_PROXY` | Playwright 代理，默认 `http://127.0.0.1:7890` |
+| `AGNES_PROXY` | Playwright 代理，默认 `http://127.0.0.1:7890`。连不上目标站时改为直连 |
 | `AGNES_TIMEOUT_MS` | Playwright UI 操作超时，默认 `120000` |
 | `AGNES_CHAT_TIMEOUT_S` | 普通回复等待秒数，默认 `300` |
 | `AGNES_THINK_TIMEOUT_S` | `deep_thinking=true` 时等待秒数，默认 `600`（开关本身为 no-op） |
