@@ -16,6 +16,7 @@ from app.services.agnes.agnes_mgr import agnes_mgr
 from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
 from app.services.chat_jobs.runner import chat_job_runner
 from app.services.deepseek.deepseek_mgr import deepseek_mgr
+from app.services.doubao.doubao_mgr import doubao_mgr
 from app.services.qwen.qwen_mgr import qwen_mgr
 
 log = app_logger
@@ -168,6 +169,32 @@ def _bootstrap_agnes() -> None:
     )
 
 
+def _bootstrap_doubao() -> None:
+    if not config.doubao_enabled:
+        log.info("doubao: skipped (disabled)")
+        return
+    if not _bool_env("BOOTSTRAP_DOUBAO", True):
+        log.info("doubao: skipped (BOOTSTRAP_DOUBAO=0)")
+        return
+    log.info(
+        "doubao: warming up profile=%s login_timeout_s=%s",
+        config.doubao_user_data_dir,
+        config.doubao_login_timeout_s,
+    )
+    try:
+        result = doubao_mgr.ensure_ready()
+        log.info(
+            "doubao: ready state=%s session_saved=%s profile=%s",
+            result.get("state"),
+            result.get("session_saved"),
+            result.get("profile"),
+        )
+    except TimeoutError as exc:
+        log.warning("doubao: %s", exc)
+    except Exception:
+        log.exception("doubao: startup failed; browser closed if login timed out")
+
+
 # Warm up browser sessions in background threads so the web server starts
 # immediately even if auto-login is slow or fails. Login is retried lazily
 # on the first chat request either way.
@@ -178,6 +205,7 @@ _bootstrap_targets = (
     ("chatgpt-bootstrap", _bootstrap_chatgpt),
     ("qwen-bootstrap", _bootstrap_qwen),
     ("agnes-bootstrap", _bootstrap_agnes),
+    ("doubao-bootstrap", _bootstrap_doubao),
 )
 _bootstrap_pending = len(_bootstrap_targets)
 _bootstrap_lock = threading.Lock()
@@ -224,6 +252,10 @@ def _shutdown_browser() -> None:
         pass
     try:
         agnes_mgr.stop()
+    except Exception:
+        pass
+    try:
+        doubao_mgr.stop()
     except Exception:
         pass
 

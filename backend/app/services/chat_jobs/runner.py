@@ -34,6 +34,7 @@ class ChatJobRunner:
         from app.services.agnes.agnes_mgr import agnes_mgr
         from app.services.chatgpt.chatgpt_mgr import chatgpt_mgr
         from app.services.deepseek.deepseek_mgr import deepseek_mgr
+        from app.services.doubao.doubao_mgr import doubao_mgr
         from app.services.qwen.qwen_mgr import qwen_mgr
 
         self._askers = {
@@ -41,6 +42,7 @@ class ChatJobRunner:
             "chatgpt": chatgpt_mgr.ask,
             "qwen": qwen_mgr.ask,
             "agnes": agnes_mgr.ask,
+            "doubao": doubao_mgr.ask,
         }
         return self._askers
 

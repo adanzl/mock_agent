@@ -167,5 +167,18 @@ class Config:
         self.agnes_password: str | None = _opt("AGNES_PASSWORD")
         self.agnes_auto_login: bool = _bool("AGNES_AUTO_LOGIN", True)
 
+        # Doubao (www.doubao.com). QR login, persistent Chrome profile.
+        # Master switch — off by default; set DOUBAO_ENABLED=1 to use.
+        self.doubao_enabled: bool = _bool("DOUBAO_ENABLED", False)
+        self.doubao_timeout_ms: int = int(os.getenv("DOUBAO_TIMEOUT_MS", "120000"))
+        self.doubao_chat_timeout_s: int = int(os.getenv("DOUBAO_CHAT_TIMEOUT_S", "300"))
+        self.doubao_think_timeout_s: int = int(os.getenv("DOUBAO_THINK_TIMEOUT_S", "600"))
+        self.doubao_login_timeout_s: int = int(os.getenv("DOUBAO_LOGIN_TIMEOUT_S", "180"))
+        self.doubao_user_data_dir: Path = _path(
+            "DOUBAO_USER_DATA_DIR",
+            BACKEND_DIR / "data" / "doubao-browser",
+            root=BACKEND_DIR,
+        )
+
 
 config = Config()
