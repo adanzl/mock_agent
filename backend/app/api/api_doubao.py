@@ -4,6 +4,7 @@ from flask import Blueprint, Response, jsonify, request
 
 from app.config import ROOT_DIR, config
 from app.services.chat_jobs.job_mgr import chat_job_mgr
+from app.services.doubao.client import DoubaoReplyError
 from app.services.doubao.doubao_mgr import doubao_mgr
 
 bp = Blueprint("doubao", __name__)
@@ -163,6 +164,9 @@ def chat():
     except ValueError as exc:
         logger.warning("chat bad request: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 400
+    except DoubaoReplyError as exc:
+        logger.warning("chat reply failed status=%s error=%s", exc.status, exc)
+        return jsonify({"ok": False, "error": str(exc)}), exc.status
     except RuntimeError as exc:
         logger.warning("chat auth/runtime: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 401

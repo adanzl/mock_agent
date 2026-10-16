@@ -151,6 +151,7 @@ class AgnesClient:
             _WorkerSlot(worker_id=i) for i in range(self.worker_count)
         ]
         self._pick_lock = threading.Lock()
+        self._launch_lock = threading.Lock()
         self._storage_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_status: dict[str, Any] | None = None
@@ -415,7 +416,7 @@ class AgnesClient:
             if not ok or state != "chat":
                 raise RuntimeError(self._login_failed_message())
         elif state != "chat":
-            self._goto(page, CHAT_URL)
+            page = self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -543,7 +544,7 @@ class AgnesClient:
             state = self._detect_shell_state(page)
 
         if state != "chat":
-            self._goto(page, CHAT_URL)
+            page = self._goto(page, CHAT_URL)
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if self._needs_account_login() and not self._has_token_cookie():
                 if not self._ensure_logged_in(page, force=True):
@@ -724,7 +725,7 @@ class AgnesClient:
             logger.info("already on conversation id=%s", conv)
             return
         logger.info("open conversation id=%s url=%s", conv, target)
-        self._goto(page, str(target))
+        page = self._goto(page, str(target))
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state != "chat":
             raise RuntimeError(f"failed to open conversation {conv}, state={state}")
@@ -797,24 +798,41 @@ class AgnesClient:
         slot = self._current_slot()
         if slot.page is not None:
             return
-        slot.playwright = sync_playwright().start()
-        slot.browser = self._launch_browser(slot.playwright)
-        context_kwargs: dict[str, Any] = {
-            "viewport": {"width": 1280, "height": 900},
-            "locale": "zh-CN",
-        }
-        stored = db_mgr.get_browser_session(PROVIDER)
-        if stored:
-            context_kwargs["storage_state"] = stored
-            logger.debug(
-                "load storage_state from sqlite provider=%s worker=%s",
-                PROVIDER,
-                slot.worker_id,
-            )
-        slot.context = slot.browser.new_context(**context_kwargs)
-        slot.page = slot.context.new_page()
-        slot.page.set_default_timeout(self.timeout_ms)
-        slot.page.add_init_script(
+        # One Chrome at a time. Two workers opening the site together, while
+        # the other providers are also launching, leaves the first navigation
+        # stuck before the document commits.
+        with self._launch_lock:
+            if slot.page is not None:
+                return
+            slot.playwright = sync_playwright().start()
+            slot.browser = self._launch_browser(slot.playwright)
+            context_kwargs: dict[str, Any] = {
+                "viewport": {"width": 1280, "height": 900},
+                "locale": "zh-CN",
+            }
+            stored = db_mgr.get_browser_session(PROVIDER)
+            if stored:
+                context_kwargs["storage_state"] = stored
+                logger.debug(
+                    "load storage_state from sqlite provider=%s worker=%s",
+                    PROVIDER,
+                    slot.worker_id,
+                )
+            slot.context = slot.browser.new_context(**context_kwargs)
+            slot.page = slot.context.new_page()
+            self._prepare_page(slot.page)
+            slot.page = self._goto(slot.page, CHAT_URL)
+        state = self._wait_shell_state(slot.page, timeout_ms=60_000)
+        logger.debug(
+            "chat page ready worker=%s state=%s url=%s",
+            slot.worker_id,
+            state,
+            slot.page.url,
+        )
+
+    def _prepare_page(self, page: Page) -> None:
+        page.set_default_timeout(self.timeout_ms)
+        page.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = window.chrome || { runtime: {} };
@@ -832,14 +850,24 @@ class AgnesClient:
                     : originalQuery(parameters);
             """
         )
-        self._goto(slot.page, CHAT_URL)
-        state = self._wait_shell_state(slot.page, timeout_ms=60_000)
-        logger.debug(
-            "chat page ready worker=%s state=%s url=%s",
-            slot.worker_id,
-            state,
-            slot.page.url,
-        )
+
+    def _replace_page(self, page: Page) -> Page:
+        """Drop a page whose navigation never committed and open another."""
+        slot = self._current_slot()
+        if slot.context is None:
+            return page
+        try:
+            fresh = slot.context.new_page()
+            self._prepare_page(fresh)
+        except Exception:
+            logger.debug("agnes replace page failed", exc_info=True)
+            return page
+        slot.page = fresh
+        try:
+            page.close()
+        except Exception:
+            pass
+        return fresh
 
     def _goto(
         self,
@@ -849,12 +877,13 @@ class AgnesClient:
         wait_until: str = "commit",
         attempts: int = 3,
         timeout_ms: int | None = None,
-    ) -> None:
+    ) -> Page:
         """Navigate without waiting for a full domcontentloaded.
 
         Agnes is a heavy SPA: under headless, domcontentloaded often hangs for
         the full UI timeout even though the document has already committed.
-        Use commit (+ short best-effort settle), and retry only if that fails.
+        Use commit (+ short best-effort settle). A timed-out page stays stuck,
+        so a retry opens a new page instead of calling goto again on it.
         """
         del wait_until  # Agnes always uses commit; keep kw for call-site compat.
         timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
@@ -867,18 +896,26 @@ class AgnesClient:
                     page.wait_for_load_state("domcontentloaded", timeout=5_000)
                 except Exception:
                     pass
-                return
+                return page
             except Exception as exc:
                 last_exc = exc
-                logger.warning(
-                    "goto stuck attempt=%s/%s url=%s error=%s",
+                if attempt >= attempts:
+                    logger.warning(
+                        "goto stuck attempt=%s/%s url=%s error=%s",
+                        attempt,
+                        attempts,
+                        url,
+                        exc,
+                    )
+                    break
+                logger.info(
+                    "goto retry attempt=%s/%s url=%s error=%s",
                     attempt,
                     attempts,
                     url,
                     exc,
                 )
-                if attempt >= attempts:
-                    break
+                page = self._replace_page(page)
                 time.sleep(1.0)
         assert last_exc is not None
         raise last_exc
@@ -1016,7 +1053,7 @@ class AgnesClient:
             self._current_slot().worker_id,
         )
         if "/login" not in (page.url or "").lower():
-            self._goto(page, AUTH_URL)
+            page = self._goto(page, AUTH_URL)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=5_000)
         except Exception:
@@ -1078,7 +1115,7 @@ class AgnesClient:
             raise RuntimeError("login submit did not leave login / set auth")
 
         if self._detect_shell_state(page) != "chat":
-            self._goto(page, CHAT_URL)
+            page = self._goto(page, CHAT_URL)
             if self._wait_shell_state(page, timeout_ms=60_000) != "chat":
                 raise RuntimeError("login submit did not reach chat UI")
 
@@ -1198,7 +1235,7 @@ class AgnesClient:
                     return
             except Exception:
                 continue
-        self._goto(page, CHAT_URL)
+        page = self._goto(page, CHAT_URL)
         self._wait_shell_state(page, timeout_ms=30_000)
 
     def _assistant_locator(self, page: Page):
