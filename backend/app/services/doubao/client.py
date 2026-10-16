@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 PROVIDER = "doubao"
 CHAT_URL = "https://www.doubao.com/chat/"
-THREAD_URL = "https://www.doubao.com/thread/{conversation_id}"
-CONVERSATION_ID_RE = re.compile(r"/thread/([^/?#]+)", re.IGNORECASE)
+THREAD_URL = "https://www.doubao.com/chat/{conversation_id}"
+CONVERSATION_ID_RE = re.compile(r"/chat/([^/?#]+)", re.IGNORECASE)
 QR_REPRINT_S = 60
 # The on-page mark is a dotted SVG. zxing reads it after a nearest-neighbor scale-up.
 _QR_SCALE = 4
@@ -55,16 +55,54 @@ def decode_qr_png(png: bytes) -> str | None:
     return None
 
 
+# Braille dots, top to bottom. Each character holds 2 columns x 4 rows.
+_BRAILLE_BITS = (
+    (0x01, 0x08),
+    (0x02, 0x10),
+    (0x04, 0x20),
+    (0x40, 0x80),
+)
+
+
 def format_qr_for_log(payload: str) -> str:
-    """Terminal QR from the qrcode library (tty colors, half blocks)."""
-    code = qrcode.QRCode(border=4)
+    """Compact terminal QR. qrcode builds the matrix; braille packs 2x4 modules per cell."""
+    code = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        border=4,
+    )
     code.add_data(payload)
     code.make(fit=True)
-    buf = io.StringIO()
-    # print_ascii(tty=True) refuses non-ttys; app.log is tailed in a terminal.
-    buf.isatty = lambda: True  # type: ignore[method-assign]
-    code.print_ascii(out=buf, tty=True)
-    return buf.getvalue().rstrip("\n")
+    modules = code.modules
+    count = code.modules_count
+    border = code.border
+    size = count + border * 2
+    width = size + (size % 2)
+    height = size + (-size % 4)
+
+    def dark(row: int, col: int) -> bool:
+        if row >= size or col >= size:
+            return False
+        r = row - border
+        c = col - border
+        if r < 0 or c < 0 or r >= count or c >= count:
+            return False
+        return bool(modules[r][c])
+
+    fg = "\033[38;5;16m"
+    bg = "\033[48;5;231m"
+    reset = "\033[0m"
+    lines: list[str] = []
+    for y in range(0, height, 4):
+        chars: list[str] = []
+        for x in range(0, width, 2):
+            bits = 0
+            for dy in range(4):
+                for dx in range(2):
+                    if dark(y + dy, x + dx):
+                        bits |= _BRAILLE_BITS[dy][dx]
+            chars.append(chr(0x2800 + bits))
+        lines.append(f"{fg}{bg}{''.join(chars)}{reset}")
+    return "\n".join(lines)
 
 
 class DoubaoClient:
@@ -589,17 +627,36 @@ class DoubaoClient:
     def _send(self, page: Page, question: str) -> None:
         composer = page.locator('[data-testid="chat_input"] .ProseMirror')
         composer.first.click(timeout=10_000)
-        page.evaluate(
-            """(text) => {
-                const el = document.querySelector('[data-testid="chat_input"] .ProseMirror');
-                if (!el) throw new Error('composer missing');
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('insertText', false, text);
-            }""",
-            question,
-        )
-        page.keyboard.press("Enter")
+        # execCommand leaves the editor marked empty, so Enter never sends.
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text(question)
+        send = page.locator('[data-testid="chat_input_send_button"]')
+        try:
+            send.first.wait_for(state="visible", timeout=8_000)
+            send.first.click(timeout=5_000)
+        except Exception as exc:
+            logger.warning("doubao send button missed, pressing Enter: %s", exc)
+            page.keyboard.press("Enter")
+        if not self._wait_send_started(page):
+            raise RuntimeError(f"doubao send did not start url={page.url}")
+
+    def _wait_send_started(self, page: Page) -> bool:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                url = page.url
+            except Exception:
+                time.sleep(0.4)
+                continue
+            if self._conversation_id_from_url(url):
+                return True
+            try:
+                if self._read_answer(page):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return False
 
     def _wait_answer(
         self,
@@ -634,6 +691,20 @@ class DoubaoClient:
             return False
 
     def _read_answer(self, page: Page) -> str:
+        scoped = page.locator(
+            '[data-testid="receive_message"] [data-testid="message_text_content"]'
+        )
+        try:
+            count = scoped.count()
+        except Exception:
+            count = 0
+        if count > 0:
+            try:
+                text = (scoped.nth(count - 1).inner_text() or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
         for selector in _ANSWER_SELECTORS:
             loc = page.locator(selector)
             try:
