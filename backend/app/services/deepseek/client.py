@@ -246,10 +246,18 @@ class DeepSeekClient:
         return slot
 
     def _pick_slot(self) -> _WorkerSlot:
-        """Prefer an idle worker; otherwise the shortest queue."""
+        """Prefer a worker already on the chat UI; otherwise idle, then shortest queue.
+
+        Asking a worker that sits on the sign-in page fails without touching any
+        healthy worker, so a degraded slot must not win just for being idle.
+        """
         with self._pick_lock:
+            ready = [s for s in self._slots if (s.last_status or {}).get("ready")]
             idle = [s for s in self._slots if not s.busy]
-            pool = idle or list(self._slots)
+            if ready:
+                pool = [s for s in ready if not s.busy] or ready
+            else:
+                pool = idle or list(self._slots)
             return min(pool, key=lambda s: s.tasks.qsize())
 
     def _submit_to(self, slot: _WorkerSlot, func: Callable[[], Any]) -> Any:
@@ -1031,19 +1039,26 @@ class DeepSeekClient:
         page.wait_for_load_state("domcontentloaded")
         time.sleep(0.8)
 
-        # Default UI is phone + SMS; switch to password login first.
-        # On the live page this control is a visible .ds-button labeled 密码登录.
-        switched = False
-        pw_mode = page.locator("div.ds-button:visible:has-text('密码登录')")
-        if pw_mode.count() == 0:
-            pw_mode = page.locator(
-                "div.ds-button:visible:has-text('Password'), "
-                "button:visible:has-text('密码登录')"
-            )
-        if pw_mode.count() > 0:
-            pw_mode.first.click(timeout=8_000)
-            switched = True
-            logger.info("switched to password login")
+        # The sign-in page has two shapes:
+        #   * fresh visit -> phone + SMS form, toggle labeled 密码登录
+        #   * expired session -> lands straight on the password form, toggle
+        #     labeled 验证码登录 (the "登录信息已失效" redirect)
+        # So only click the toggle when no password input is rendered yet.
+        # On the live page the toggle is a visible .ds-button.
+        switched = page.locator("input[type='password']").count() > 0
+        if switched:
+            logger.info("sign-in page already shows password form")
+        else:
+            pw_mode = page.locator("div.ds-button:visible:has-text('密码登录')")
+            if pw_mode.count() == 0:
+                pw_mode = page.locator(
+                    "div.ds-button:visible:has-text('Password'), "
+                    "button:visible:has-text('密码登录')"
+                )
+            if pw_mode.count() > 0:
+                pw_mode.first.click(timeout=8_000)
+                switched = True
+                logger.info("switched to password login")
         if not switched:
             raise RuntimeError("password-login control not found on sign-in page")
 
@@ -1077,6 +1092,15 @@ class DeepSeekClient:
         while time.time() < deadline:
             if self._detect_shell_state(page) == "chat":
                 return
+            # Risk control: DeepSeek may ask for an email/SMS code or an image
+            # captcha after the password is accepted. Those cannot be automated,
+            # so fail with a message that says what to do instead.
+            if page.locator("text=验证账号").count() > 0:
+                raise RuntimeError(
+                    "deepseek requires manual account verification (验证账号); "
+                    "automated login cannot pass the captcha/email code, "
+                    "sign in once in a real browser and save the session"
+                )
             time.sleep(0.5)
         raise RuntimeError("login submit did not reach chat UI")
 
