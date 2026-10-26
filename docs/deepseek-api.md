@@ -67,7 +67,8 @@ curl -s http://127.0.0.1:8765/api/deepseek/chat ^
 | GET | `/health` | 进程健康检查（根路径也有 `/health`） |
 | GET | `/api/deepseek/health` | DeepSeek 模块健康检查 |
 | GET | `/api/deepseek/doc` | 返回本文档 Markdown 原文 |
-| GET | `/api/deepseek/status` | 登录态 / 浏览器状态 |
+| GET | `/api/deepseek/status` | 登录态 / 浏览器状态（含 `login` 熔断信息） |
+| POST | `/api/deepseek/login/reset` | 人工修好会话后清掉登录熔断 |
 | POST | `/api/deepseek/chat` | 提问（同步，长内容易被网关超时掐断） |
 | POST | `/api/deepseek/chat/async` | 异步提问（立即返回 `job_id`） |
 | GET | `/api/deepseek/chat/jobs/<id>` | 查询异步任务状态 / 结果 |
@@ -298,11 +299,35 @@ curl -s -X POST "http://127.0.0.1:8765/api/deepseek/conversations/xxxxxxxx-xxxx-
 
 登录由服务端自动完成：启动时、以及 `/chat` 发现未登录时，都会用 `.env` 的 `DEEPSEEK_USERNAME` / `DEEPSEEK_PASSWORD` 填表登录，并把登录态写入 SQLite（`browser_session`）。
 
+密码登录是 DeepSeek 风控最敏感的动作，所以有三道刹车：
+
+1. **只登一次**：`DEEPSEEK_WORKERS` 大于 1 时，只有 worker 0 提交密码，其余 worker 直接复用 worker 0 存下的 `storage_state`，不会再各自登录一次。
+2. **登录熔断**：`DEEPSEEK_LOGIN_WINDOW_S`（默认 7200 秒）内最多提交 `DEEPSEEK_LOGIN_MAX_ATTEMPTS`（默认 2）次密码；失败一次进入冷却，按 `DEEPSEEK_LOGIN_COOLDOWNS`（默认 `1800,7200,21600`，即 30 分钟 → 2 小时 → 6 小时）逐级拉长，冷却期内直接跳过，不再点登录按钮。
+3. **验证账号硬停**：页面出现 `验证账号`（需要验证码 / 邮箱码）时，密码登录无法通过，客户端会置 `manual_login_required` 并**永久停止**自动登录，直到人工处理。此时先在有界面的真实浏览器里登录一次、把会话存进 `browser_session`（或用 `HEADLESS=0` 跑一次），再调 `POST /api/deepseek/login/reset` 清掉熔断。
+
+请求节奏也有限制：每次提问（含超时后的重试）都过一道闸门，两次发送至少间隔 `DEEPSEEK_MIN_GAP_S`（默认 9 秒，带 ±30% 抖动），且 60 秒内不超过 `DEEPSEEK_MAX_RPM`（默认 6）次。
+
 查看当前状态：
 
 `GET /api/deepseek/status`
 
-关注字段：`ready`（是否在聊天页）、`state`（`chat` / `auth` / `unknown`）、`session_saved`；并行池还会返回 `workers` / `busy` / `idle` / `queued` / `workers_detail`。
+关注字段：`ready`（是否在聊天页）、`state`（`chat` / `auth` / `unknown`）、`session_saved`；并行池还会返回 `workers` / `busy` / `idle` / `queued` / `workers_detail`。`login` 子对象给出熔断状态：
+
+```json
+"login": {
+  "manual_login_required": false,
+  "reason": "",
+  "failures": 0,
+  "attempts_in_window": 0,
+  "cooldown_s": 0
+}
+```
+
+清掉熔断（人工修好会话之后）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/api/deepseek/login/reset
+```
 
 ---
 
@@ -358,4 +383,9 @@ print(r2["answer"])
 | `DEEPSEEK_CHAT_TIMEOUT_S` | 普通聊天等待回复秒数，默认 300 |
 | `DEEPSEEK_THINK_TIMEOUT_S` | 专家模式或深度思考等待回复秒数，默认 600 |
 | `DEEPSEEK_WORKERS` | 并行浏览器 worker 数（1–4），默认 2；每个 worker 独立页面，多路 `/chat` 可同时进行 |
+| `DEEPSEEK_LOGIN_MAX_ATTEMPTS` | 每个窗口内允许提交的密码登录次数，默认 2 |
+| `DEEPSEEK_LOGIN_WINDOW_S` | 密码登录计数的滑动窗口（秒），默认 7200 |
+| `DEEPSEEK_LOGIN_COOLDOWNS` | 登录失败后的冷却阶梯（秒，逗号分隔），默认 `1800,7200,21600` |
+| `DEEPSEEK_MIN_GAP_S` | 两次提问的最小间隔（秒，±30% 抖动），默认 9 |
+| `DEEPSEEK_MAX_RPM` | 每 60 秒最多发送次数，默认 6；设为 `0` 关闭该上限 |
 | `LOG_DIR` | 日志目录，默认 `logs` |

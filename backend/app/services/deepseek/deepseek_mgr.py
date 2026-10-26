@@ -24,6 +24,10 @@ class DeepSeekMgr:
     def ensure_ready(self) -> dict[str, Any]:
         return self._get_client().ensure_ready()
 
+    def reset_login_guard(self) -> dict[str, Any]:
+        """清除登录熔断：人工把会话修好之后调用一次。"""
+        return self._get_client().reset_login_guard()
+
     def start(self) -> None:
         self._get_client().start()
 

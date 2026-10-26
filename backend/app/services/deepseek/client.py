@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import queue
+import random
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -42,6 +44,145 @@ class _WorkerSlot:
     page: Page | None = None
     busy: bool = False
     last_status: dict[str, Any] | None = None
+
+
+# DeepSeek shows this when the account is under risk control. Only a human can
+# pass the captcha / SMS step, so every further automatic retry only deepens
+# the flag that produced it.
+MANUAL_VERIFICATION_MARKER = "验证账号"
+
+
+class _SendGate:
+    """Pace outbound questions: a minimum gap plus a rolling per-minute budget."""
+
+    def __init__(self, *, min_gap_s: float, max_rpm: int) -> None:
+        self.min_gap_s = max(0.0, float(min_gap_s))
+        self.max_rpm = max(0, int(max_rpm))
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+        self._sent: deque[float] = deque()
+
+    def wait(self) -> float:
+        """Block until the next send is allowed; returns the seconds slept."""
+        with self._lock:
+            slept = 0.0
+            while True:
+                now = time.monotonic()
+                if self.max_rpm > 0:
+                    cutoff = now - 60.0
+                    while self._sent and self._sent[0] <= cutoff:
+                        self._sent.popleft()
+                target = self._next_at
+                if self.max_rpm > 0 and len(self._sent) >= self.max_rpm:
+                    target = max(target, self._sent[0] + 60.0)
+                delay = target - now
+                if delay <= 0:
+                    break
+                time.sleep(delay)
+                slept += delay
+            stamp = time.monotonic()
+            self._sent.append(stamp)
+            # ±30% jitter so the cadence never looks like a metronome.
+            self._next_at = stamp + self.min_gap_s * random.uniform(0.7, 1.3)
+            if slept > 1.0:
+                logger.info(
+                    "send gate slept=%.1fs min_gap=%.1fs max_rpm=%s",
+                    slept,
+                    self.min_gap_s,
+                    self.max_rpm,
+                )
+            return slept
+
+
+class _LoginGuard:
+    """Cap password logins and stop for good when a human is required."""
+
+    def __init__(
+        self,
+        *,
+        max_attempts: int,
+        window_s: int,
+        cooldowns: list[int],
+    ) -> None:
+        self.max_attempts = max(1, int(max_attempts))
+        self.window_s = max(60, int(window_s))
+        self.cooldowns = [max(60, int(item)) for item in cooldowns] or [1800]
+        self._lock = threading.Lock()
+        self._attempts: deque[float] = deque()
+        self._failures = 0
+        self._blocked_until = 0.0
+        self._manual_reason = ""
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_s
+        while self._attempts and self._attempts[0] <= cutoff:
+            self._attempts.popleft()
+
+    def blocked_reason(self) -> str:
+        """Why a password login must not run now (empty string means allowed)."""
+        with self._lock:
+            if self._manual_reason:
+                return self._manual_reason
+            now = time.monotonic()
+            if now < self._blocked_until:
+                return (
+                    f"cooling down {int(self._blocked_until - now)}s "
+                    f"after {self._failures} failed login(s)"
+                )
+            self._prune(now)
+            if len(self._attempts) >= self.max_attempts:
+                wait = int(self._attempts[0] + self.window_s - now)
+                return (
+                    f"{len(self._attempts)} login attempt(s) within "
+                    f"{self.window_s}s; retry in {wait}s"
+                )
+            return ""
+
+    def begin(self) -> None:
+        with self._lock:
+            self._attempts.append(time.monotonic())
+
+    def succeeded(self) -> None:
+        with self._lock:
+            self._attempts.clear()
+            self._failures = 0
+            self._blocked_until = 0.0
+            self._manual_reason = ""
+
+    def failed(self, reason: str, *, manual: bool) -> None:
+        with self._lock:
+            if manual:
+                # No timer: only a human signing in can clear this.
+                self._manual_reason = reason
+                logger.error("deepseek login paused until manual sign-in: %s", reason)
+                return
+            self._failures += 1
+            cooldown = self.cooldowns[min(self._failures - 1, len(self.cooldowns) - 1)]
+            self._blocked_until = time.monotonic() + cooldown
+            logger.warning(
+                "deepseek login failed %s time(s); next attempt in %ss",
+                self._failures,
+                cooldown,
+            )
+
+    def reset(self) -> None:
+        with self._lock:
+            self._attempts.clear()
+            self._failures = 0
+            self._blocked_until = 0.0
+            self._manual_reason = ""
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            now = time.monotonic()
+            attempts = sum(1 for ts in self._attempts if ts > now - self.window_s)
+            return {
+                "manual_login_required": bool(self._manual_reason),
+                "reason": self._manual_reason,
+                "failures": self._failures,
+                "attempts_in_window": attempts,
+                "cooldown_s": max(0, int(self._blocked_until - now)),
+            }
 
 MODE_ALIASES = {
     "fast": "instant",
@@ -180,6 +321,16 @@ class DeepSeekClient:
         self.username = config.deepseek_username
         self.password = config.deepseek_password
         self.auto_login = config.deepseek_auto_login
+        # One account, one site: pace every question and cap password logins.
+        self._send_gate = _SendGate(
+            min_gap_s=config.deepseek_min_gap_s,
+            max_rpm=config.deepseek_max_rpm,
+        )
+        self._login_guard = _LoginGuard(
+            max_attempts=config.deepseek_login_max_attempts,
+            window_s=config.deepseek_login_window_s,
+            cooldowns=config.deepseek_login_cooldowns,
+        )
         self.worker_count = max(
             1,
             min(4, int(config.deepseek_workers if workers is None else workers)),
@@ -317,6 +468,7 @@ class DeepSeekClient:
             "busy": 0,
             "idle": self.worker_count,
             "queued": 0,
+            "login": self._login_guard.snapshot(),
         }
 
     def _refresh_slot_status(self, slot: _WorkerSlot) -> None:
@@ -367,6 +519,7 @@ class DeepSeekClient:
                 "idle": max(0, self.worker_count - busy),
                 "queued": queued,
                 "workers_detail": details,
+                "login": self._login_guard.snapshot(),
             }
 
     def start(self) -> None:
@@ -401,12 +554,28 @@ class DeepSeekClient:
         return self._default_status()
 
     def ensure_ready(self) -> dict[str, Any]:
-        """Start every worker browser and auto-login from .env if needed."""
-        results = self._submit_all(self._ensure_ready_impl)
+        """Start every worker browser, logging in at most once for the pool.
+
+        Two workers submitting the same password in the same second is exactly
+        the pattern that got the account flagged, so follower workers reload
+        the session the primary worker saved instead of logging in again.
+        """
+        primary, *followers = self._slots
+        results: list[dict[str, Any]] = [self._submit_to(primary, self._ensure_ready_impl)]
+        for slot in followers:
+            try:
+                results.append(self._submit_to(slot, self._reuse_session_impl))
+            except Exception as exc:
+                logger.warning(
+                    "deepseek worker %s could not reuse the saved session: %s",
+                    slot.worker_id,
+                    exc,
+                )
         self._publish_status()
         merged = dict(results[0] if results else {"ok": True, "ready": False})
         merged["workers"] = self.worker_count
         merged["ready_workers"] = sum(1 for r in results if r and r.get("ready"))
+        merged["login"] = self._login_guard.snapshot()
         if self._last_status:
             merged.update(
                 {
@@ -418,6 +587,27 @@ class DeepSeekClient:
             )
         return merged
 
+    def _login_failure_hint(self) -> str:
+        blocked = self._login_guard.blocked_reason()
+        if blocked:
+            return f"auto login skipped: {blocked}"
+        return "auto login failed; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
+
+    def _not_logged_in_error(self, detail: str = "") -> RuntimeError:
+        blocked = self._login_guard.blocked_reason()
+        suffix = f" {detail}".rstrip() if detail else ""
+        if blocked:
+            return RuntimeError(f"not logged in ({blocked}){suffix}")
+        return RuntimeError(
+            f"not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env{suffix}"
+        )
+
+    def reset_login_guard(self) -> dict[str, Any]:
+        """Clear the login breaker after a human signed in somewhere else."""
+        self._login_guard.reset()
+        logger.info("deepseek login breaker reset")
+        return self._login_guard.snapshot()
+
     def _ensure_ready_impl(self) -> dict[str, Any]:
         page = self._ensure_page_unlocked()
         state = self._detect_shell_state(page)
@@ -425,16 +615,12 @@ class DeepSeekClient:
             ok = self._ensure_logged_in(page)
             state = self._detect_shell_state(page)
             if not ok or state != "chat":
-                raise RuntimeError(
-                    "auto login failed; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise RuntimeError(self._login_failure_hint())
         elif state != "chat":
             page.goto(CHAT_URL, wait_until="domcontentloaded")
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if state == "auth" and not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "auto login failed; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise RuntimeError(self._login_failure_hint())
             state = self._detect_shell_state(page)
             if state != "chat":
                 raise RuntimeError(f"chat UI not ready, state={state}")
@@ -447,6 +633,28 @@ class DeepSeekClient:
             "url": page.url,
             "session_saved": db_mgr.has_browser_session(PROVIDER),
             "worker_id": self._current_slot().worker_id,
+        }
+
+    def _reuse_session_impl(self) -> dict[str, Any]:
+        """Adopt the session the primary worker just saved; never logs in."""
+        slot = self._current_slot()
+        page = self._ensure_page_unlocked()
+        state = self._detect_shell_state(page)
+        if state != "chat":
+            # This context predates the primary login, so rebuild it from the
+            # storage_state that login saved to sqlite.
+            self._stop_unlocked()
+            page = self._ensure_page_unlocked()
+            state = self._detect_shell_state(page)
+        self._refresh_slot_status(slot)
+        logger.info("worker %s reused saved session state=%s", slot.worker_id, state)
+        return {
+            "ok": True,
+            "ready": state == "chat",
+            "state": state,
+            "url": page.url,
+            "session_saved": db_mgr.has_browser_session(PROVIDER),
+            "worker_id": slot.worker_id,
         }
 
     def ask(
@@ -476,6 +684,9 @@ class DeepSeekClient:
         attempts = 2
         last_exc: BaseException | None = None
         for attempt in range(1, attempts + 1):
+            # Pace every send (including the retry) so a burst cannot look like
+            # a bot; the gate also spaces the immediate TimeoutError retry.
+            self._send_gate.wait()
             try:
                 return self._submit(
                     lambda: self._ask_impl(
@@ -531,17 +742,13 @@ class DeepSeekClient:
         )
         if state == "auth":
             if not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise self._not_logged_in_error()
             state = self._detect_shell_state(page)
         if state != "chat":
             page.goto(CHAT_URL, wait_until="domcontentloaded")
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if state == "auth" and not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise self._not_logged_in_error()
             state = self._detect_shell_state(page)
             if state != "chat":
                 raise RuntimeError(f"chat UI not ready, state={state}")
@@ -638,19 +845,14 @@ class DeepSeekClient:
         )
         if state == "auth":
             if not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env "
-                    f"(sqlite={db_mgr.path()})"
-                )
+                raise self._not_logged_in_error(f"(sqlite={db_mgr.path()})")
             state = self._detect_shell_state(page)
 
         if state != "chat":
             page.goto(CHAT_URL, wait_until="domcontentloaded")
             state = self._wait_shell_state(page, timeout_ms=60_000)
             if state == "auth" and not self._ensure_logged_in(page):
-                raise RuntimeError(
-                    "not logged in; check DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD in .env"
-                )
+                raise self._not_logged_in_error()
             state = self._detect_shell_state(page)
             if state != "chat":
                 raise RuntimeError(f"chat UI not ready, state={state}")
@@ -1018,16 +1220,28 @@ class DeepSeekClient:
         if not self.username or not self.password:
             logger.warning("auth page but DEEPSEEK_USERNAME/DEEPSEEK_PASSWORD missing in .env")
             return False
+        blocked = self._login_guard.blocked_reason()
+        if blocked:
+            logger.warning("password login skipped: %s", blocked)
+            return False
+        self._login_guard.begin()
         try:
             self._password_login(page)
         except Exception as exc:
             logger.exception("password login failed: %s", exc)
+            text = str(exc)
+            self._login_guard.failed(
+                text,
+                manual=MANUAL_VERIFICATION_MARKER in text,
+            )
             return False
         state = self._wait_shell_state(page, timeout_ms=60_000)
         if state == "chat":
+            self._login_guard.succeeded()
             self._save_storage_unlocked()
             logger.info("password login ok, storage saved")
             return True
+        self._login_guard.failed(f"login finished but state={state}", manual=False)
         logger.error("password login finished but state=%s", state)
         return False
 

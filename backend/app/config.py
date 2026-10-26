@@ -19,6 +19,31 @@ def _bool(key: str, default: bool = False) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _int_list(key: str, default: str) -> list[int]:
+    """逗号分隔的整数列表，例如 DEEPSEEK_LOGIN_COOLDOWNS=1800,7200,21600。"""
+    raw = os.getenv(key, default)
+    values: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            continue
+    return values or [int(item) for item in default.split(",")]
+
+
 def _opt(key: str) -> str | None:
     val = os.getenv(key)
     return val.strip() if val and val.strip() else None
@@ -88,6 +113,22 @@ class Config:
         )
         self.deepseek_password: str | None = _opt("DEEPSEEK_PASSWORD")
         self.deepseek_auto_login: bool = _bool("DEEPSEEK_AUTO_LOGIN", True)
+        # Password logins are the riskiest action on the site: one wrong storm
+        # gets the account flagged. Allow only a couple per window, then cool
+        # down 30min -> 2h -> 6h (DEEPSEEK_LOGIN_COOLDOWNS).
+        self.deepseek_login_max_attempts: int = max(
+            1, int(os.getenv("DEEPSEEK_LOGIN_MAX_ATTEMPTS", "2"))
+        )
+        self.deepseek_login_window_s: int = int(
+            os.getenv("DEEPSEEK_LOGIN_WINDOW_S", "7200")
+        )
+        self.deepseek_login_cooldowns: list[int] = _int_list(
+            "DEEPSEEK_LOGIN_COOLDOWNS", "1800,7200,21600"
+        )
+        # Outbound pacing: minimum gap between two questions plus a rolling
+        # per-minute cap, so a burst never looks like a bot.
+        self.deepseek_min_gap_s: float = _float("DEEPSEEK_MIN_GAP_S", 9.0)
+        self.deepseek_max_rpm: int = max(0, int(os.getenv("DEEPSEEK_MAX_RPM", "6")))
 
         # ChatGPT account / session (browser via local proxy)
         # Master switch — off by default; set CHATGPT_ENABLED=1 to use GPT.

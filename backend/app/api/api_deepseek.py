@@ -73,6 +73,20 @@ def status():
         return jsonify({"ok": False, "enabled": True, "error": str(exc)}), 500
 
 
+@bp.post("/login/reset")
+def login_reset():
+    """人工修好 DeepSeek 会话后，清掉登录熔断，允许下一次自动登录。"""
+    if not config.deepseek_enabled:
+        return _disabled_response()
+    try:
+        login = deepseek_mgr.reset_login_guard()
+        logger.info("login breaker reset by request")
+        return jsonify({"ok": True, "login": login})
+    except Exception as exc:
+        logger.exception("login reset failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @bp.get("/conversations")
 def conversations():
     if not config.deepseek_enabled:
